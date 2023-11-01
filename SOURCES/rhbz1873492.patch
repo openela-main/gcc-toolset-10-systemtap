@@ -1,0 +1,108 @@
+commit ea5f10ba55fce68d1ed614ca33afdb38816f0830
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Mon Nov 16 18:54:11 2020 -0500
+
+    PR26665: mokutil output parsing tweaks
+    
+    We encountered secureboot keys in the wild that didn't live up
+    to the expectations of the current little state machine.  Tweaked
+    regexps to accept Issuer: O= as well as Issuer: CN= lines.  With
+    more verbosity, produces output on parsing process.
+
+diff --git a/session.cxx b/session.cxx
+index b5a8044..0437ca4 100644
+--- a/session.cxx
++++ b/session.cxx
+@@ -2859,6 +2859,9 @@ systemtap_session::get_mok_info()
+       // PR26665: but only Systemtap MOK keys; there may be others.
+       getline(out, line);
+ 
++      if (verbose > 3)
++        clog << "MOK parse state: " << state << " line: " << line << endl;
++      
+       if (state == "SHA1") { // look for a new key fingerprint
+ 	if (! regexp_match(line, "^SHA1 Fingerprint: ([0-9a-f:]+)$", matches))
+ 	  {
+@@ -2871,11 +2874,14 @@ systemtap_session::get_mok_info()
+ 	  }
+ 	// else stay in SHA1 state
+       } else if (state == "Issuer") { // validate issuer
+-	if (! regexp_match(line, "^[ \t]*Issuer: O=(.*)$", matches)) {
++	if (! regexp_match(line, "^[ \t]*Issuer: [A-Z]*=(.*)$", matches)) {
+ 	  if (verbose > 2)
+ 	    clog << "Issuer found: " << matches[1] << endl;
+-	  if (! regexp_match(matches[1], "Systemtap", matches))
++	  if (! regexp_match(matches[1], "Systemtap", matches)) {
++            if (verbose > 2)
++              clog << "Recognized Systemtap MOK fingerprint: " << fingerprint << endl;
+ 	    mok_fingerprints.push_back(fingerprint);
++          }
+ 	  state = "SHA1"; // start looking for another key
+ 	}
+       } else { // some other line in mokutil output ... there are plenty
+commit 532eb9a1502026300a7f0b4bd287499101dd5803
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Tue Nov 17 16:34:59 2020 -0500
+
+    PR26665 detect rhel8 (4.18) era kernel_is_locked_down() as procfs trigger
+    
+    A different older kernel API needs to be probed for rhel8 era detection
+    of lockdown in effect.  Added an (undocumented) $SYSTEMTAP_NOSIGN env
+    var to override automatic --use-server on lockdown, so that one can
+    inspect runtime/autoconf* operation locally, without stap-server.
+
+diff --git a/buildrun.cxx b/buildrun.cxx
+index 9b4066d..9c8e648 100644
+--- a/buildrun.cxx
++++ b/buildrun.cxx
+@@ -517,6 +517,7 @@ compile_pass (systemtap_session& s)
+   output_autoconf(s, o, cs, "autoconf-atomic_fetch_add_unless.c",
+ 		  "STAPCONF_ATOMIC_FETCH_ADD_UNLESS", NULL);
+   output_autoconf(s, o, cs, "autoconf-lockdown-debugfs.c", "STAPCONF_LOCKDOWN_DEBUGFS", NULL);
++  output_autoconf(s, o, cs, "autoconf-lockdown-kernel.c", "STAPCONF_LOCKDOWN_KERNEL", NULL);
+   
+   // used by runtime/linux/netfilter.c
+   output_exportconf(s, o2, "nf_register_hook", "STAPCONF_NF_REGISTER_HOOK");
+diff --git a/runtime/linux/autoconf-lockdown-kernel.c b/runtime/linux/autoconf-lockdown-kernel.c
+new file mode 100644
+index 0000000..90c2414
+--- /dev/null
++++ b/runtime/linux/autoconf-lockdown-kernel.c
+@@ -0,0 +1,5 @@
++#include <linux/kernel.h>
++
++int foo(void) {
++  return kernel_is_locked_down("something");
++}
+diff --git a/runtime/transport/transport.c b/runtime/transport/transport.c
+index bb4a98b..5795533 100644
+--- a/runtime/transport/transport.c
++++ b/runtime/transport/transport.c
+@@ -123,6 +123,12 @@ static int _stp_transport_fs_init(const char *module_name)
+ 		dbug_trans(1, "choosing procfs_p=1\n");
+         }
+ #endif
++#ifdef STAPCONF_LOCKDOWN_KERNEL
++        if (!debugfs_p && kernel_is_locked_down ("debugfs")) {
++                procfs_p = 1;
++		dbug_trans(1, "choosing procfs_p=1\n");
++        }
++#endif
+         if (!procfs_p) {
+                 debugfs_p = 1;
+ 		dbug_trans(1, "choosing debugfs_p=1\n");
+diff --git a/session.cxx b/session.cxx
+index 0437ca4..36a4053 100644
+--- a/session.cxx
++++ b/session.cxx
+@@ -2804,7 +2804,9 @@ systemtap_session::modules_must_be_signed()
+ 
+   if (getenv("SYSTEMTAP_SIGN"))
+     return true;
+-
++  if (getenv("SYSTEMTAP_NOSIGN"))
++    return false;
++  
+   statm >> status;
+   if (status == 'Y')
+     return true;

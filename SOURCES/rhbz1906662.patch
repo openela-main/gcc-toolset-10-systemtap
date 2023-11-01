@@ -1,0 +1,2831 @@
+commit 374d37118ae1274077a425261ef1428151eb6d7c
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Tue Nov 10 10:03:34 2020 -0800
+
+    stp_utrace: disable IRQs when holding the bucket spin lock
+    
+    This lock can be acquired from inside an IRQ, leading to a deadlock:
+    
+    WARNING: inconsistent lock state
+    4.14.35-1902.6.6.el7uek.x86_64.debug #2 Tainted: G           OE
+    --------------------------------
+    inconsistent {HARDIRQ-ON-W} -> {IN-HARDIRQ-W} usage.
+    sh/15779 [HC1[1]:SC0[0]:HE0:SE1] takes:
+     (&(lock)->rlock#3){?.+.}, at: [<ffffffffc0c080b0>] _stp_mempool_alloc+0x35/0xab [orxray_lj_lua_fgraph_XXXXXXX]
+    {HARDIRQ-ON-W} state was registered at:
+      lock_acquire+0xe0/0x238
+      _raw_spin_lock+0x3d/0x7a
+      utrace_task_alloc+0xa4/0xe3 [orxray_lj_lua_fgraph_XXXXXXX]
+      utrace_attach_task+0x136/0x194 [orxray_lj_lua_fgraph_XXXXXXX]
+      __stp_utrace_attach+0x57/0x216 [orxray_lj_lua_fgraph_XXXXXXX]
+      stap_start_task_finder+0x12e/0x33f [orxray_lj_lua_fgraph_XXXXXXX]
+      systemtap_module_init+0x114d/0x11f0 [orxray_lj_lua_fgraph_XXXXXXX]
+      _stp_handle_start+0xea/0x1c5 [orxray_lj_lua_fgraph_XXXXXXX]
+      _stp_ctl_write_cmd+0x28d/0x2d1 [orxray_lj_lua_fgraph_XXXXXXX]
+      full_proxy_write+0x67/0xbb
+      __vfs_write+0x3a/0x170
+      vfs_write+0xc7/0x1c0
+      SyS_write+0x58/0xbf
+      do_syscall_64+0x7e/0x22c
+      entry_SYSCALL_64_after_hwframe+0x16e/0x0
+    irq event stamp: 9454
+    hardirqs last  enabled at (9453): [<ffffffffa696c960>] _raw_write_unlock_irqrestore+0x40/0x67
+    hardirqs last disabled at (9454): [<ffffffffa6a05417>] apic_timer_interrupt+0x1c7/0x1d1
+    softirqs last  enabled at (9202): [<ffffffffa6c00361>] __do_softirq+0x361/0x4e5
+    softirqs last disabled at (9195): [<ffffffffa60aeb76>] irq_exit+0xf6/0x102
+    
+    other info that might help us debug this:
+     Possible unsafe locking scenario:
+    
+           CPU0
+           ----
+      lock(&(lock)->rlock#3);
+      <Interrupt>
+        lock(&(lock)->rlock#3);
+    
+     *** DEADLOCK ***
+    
+    no locks held by sh/15779.
+    
+    stack backtrace:
+    CPU: 16 PID: 15779 Comm: sh Tainted: G           OE   4.14.35-1902.6.6.el7uek.x86_64.debug #2
+    Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.13.0-2.fc32 04/01/2014
+    Call Trace:
+     <IRQ>
+     dump_stack+0x81/0xb6
+     print_usage_bug+0x1fc/0x20d
+     ? check_usage_backwards+0x130/0x12b
+     mark_lock+0x1f8/0x27b
+     __lock_acquire+0x6e7/0x165a
+     ? sched_clock_local+0x18/0x81
+     ? perf_swevent_hrtimer+0x136/0x151
+     lock_acquire+0xe0/0x238
+     ? _stp_mempool_alloc+0x35/0xab [orxray_lj_lua_fgraph_XXXXXXX]
+     _raw_spin_lock_irqsave+0x55/0x97
+     ? _stp_mempool_alloc+0x35/0xab [orxray_lj_lua_fgraph_XXXXXXX]
+     _stp_mempool_alloc+0x35/0xab [orxray_lj_lua_fgraph_XXXXXXX]
+     _stp_ctl_get_buffer+0x69/0x215 [orxray_lj_lua_fgraph_XXXXXXX]
+     _stp_ctl_send+0x4e/0x169 [orxray_lj_lua_fgraph_XXXXXXX]
+     _stp_vlog+0xac/0x143 [orxray_lj_lua_fgraph_XXXXXXX]
+     ? _stp_utrace_probe_cb+0xa4/0xa4 [orxray_lj_lua_fgraph_XXXXXXX]
+     _stp_warn+0x6a/0x88 [orxray_lj_lua_fgraph_XXXXXXX]
+     function___global_warn__overload_0+0x60/0xac [orxray_lj_lua_fgraph_XXXXXXX]
+     probe_67+0xce/0x10e [orxray_lj_lua_fgraph_XXXXXXX]
+     _stp_hrtimer_notify_function+0x2db/0x55f [orxray_lj_lua_fgraph_XXXXXXX]
+     __hrtimer_run_queues+0x132/0x5c5
+     hrtimer_interrupt+0xb7/0x1ca
+     smp_apic_timer_interrupt+0xa5/0x35a
+     apic_timer_interrupt+0x1cc/0x1d1
+     </IRQ>
+
+diff --git a/runtime/stp_utrace.c b/runtime/stp_utrace.c
+index e2880f1e4..46ba48923 100644
+--- a/runtime/stp_utrace.c
++++ b/runtime/stp_utrace.c
+@@ -490,9 +490,9 @@ static int utrace_exit(void)
+ 		rcu_read_lock();
+ 		stap_hlist_for_each_entry_rcu(utrace, node, &bucket->head, hlist) {
+ 			utrace->freed = true;
+-			stp_spin_lock(&bucket->lock);
++			stp_spin_lock_irqsave(&bucket->lock, flags);
+ 			hlist_del_rcu(&utrace->hlist);
+-			stp_spin_unlock(&bucket->lock);
++			stp_spin_unlock_irqrestore(&bucket->lock, flags);
+ 
+ 			utrace_cleanup(utrace);
+ 		}
+@@ -724,6 +724,7 @@ static struct utrace *utrace_task_alloc(struct utrace_bucket *bucket,
+ 					struct task_struct *task)
+ {
+ 	struct utrace *utrace;
++	unsigned long flags;
+ 
+ 	utrace = kmem_cache_zalloc(utrace_cachep, STP_ALLOC_FLAGS);
+ 	if (unlikely(!utrace))
+@@ -739,9 +740,9 @@ static struct utrace *utrace_task_alloc(struct utrace_bucket *bucket,
+ 	atomic_set(&utrace->resume_work_added, 0);
+ 	atomic_set(&utrace->report_work_added, 0);
+ 
+-	stp_spin_lock(&bucket->lock);
++	stp_spin_lock_irqsave(&bucket->lock, flags);
+ 	hlist_add_head_rcu(&utrace->hlist, &bucket->head);
+-	stp_spin_unlock(&bucket->lock);
++	stp_spin_unlock_irqrestore(&bucket->lock, flags);
+ 	return utrace;
+ }
+ 
+@@ -768,15 +769,17 @@ static struct utrace *utrace_task_alloc(struct utrace_bucket *bucket,
+  */
+ static void utrace_free(struct utrace_bucket *bucket, struct utrace *utrace)
+ {
++	unsigned long flags;
++
+ 	if (unlikely(!utrace))
+ 		return;
+ 
+ 	/* Remove this utrace from the mapping list of tasks to
+ 	 * struct utrace. */
+ 	utrace->freed = true;
+-	stp_spin_lock(&bucket->lock);
++	stp_spin_lock_irqsave(&bucket->lock, flags);
+ 	hlist_del_rcu(&utrace->hlist);
+-	stp_spin_unlock(&bucket->lock);
++	stp_spin_unlock_irqrestore(&bucket->lock, flags);
+ 
+ 	/* Free the utrace struct. */
+ #ifdef STP_TF_DEBUG
+commit 6a092f5ae824d4ce972c10b8681b9272e2fd67f3
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Tue Nov 17 11:03:53 2020 -0800
+
+    task_finder: call _stp_vma_done() upon error to fix memory leak
+    
+    The memory allocated inside stap_initialize_vma_map() is not freed upon
+    error when the task finder is started because a call to _stp_vma_done()
+    in the error path is missing. Add it to fix the leak.
+
+diff --git a/task_finder.cxx b/task_finder.cxx
+index d08d44a75..7c45e728b 100644
+--- a/task_finder.cxx
++++ b/task_finder.cxx
+@@ -66,6 +66,7 @@ task_finder_derived_probe_group::emit_module_init (systemtap_session& s)
+ 
+   s.op->newline() << "if (rc) {";
+   s.op->newline(1) << "stap_stop_task_finder();";
++  s.op->newline() << "_stp_vma_done();";
+   s.op->newline(-1) << "}";
+   s.op->newline(-1) << "}";
+ }
+commit 3c4f82ca024df4f8e213f7c77418493262d4a4d7
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Tue Nov 24 10:50:10 2020 -0800
+
+    runtime_context: factor out RCU usage using a rw lock
+    
+    We can factor out the RCU insanity in here by just adding in a rw lock
+    and using that to synchronize _stp_runtime_contexts_free() with any code
+    that has the runtime context held.
+
+diff --git a/runtime/linux/runtime_context.h b/runtime/linux/runtime_context.h
+index 41fecba81..18566957a 100644
+--- a/runtime/linux/runtime_context.h
++++ b/runtime/linux/runtime_context.h
+@@ -11,15 +11,14 @@
+ #ifndef _LINUX_RUNTIME_CONTEXT_H_
+ #define _LINUX_RUNTIME_CONTEXT_H_
+ 
+-#ifndef __rcu
+-#define __rcu
+-#endif
+-
+-static struct context __rcu *contexts[NR_CPUS] = { NULL };
++/* Can't use STP_DEFINE_RWLOCK() or this might be replaced with a spin lock */
++static DEFINE_RWLOCK(_stp_context_lock);
++static DEFINE_PER_CPU(struct context *, contexts);
++static atomic_t _stp_context_stop = ATOMIC_INIT(0);
+ 
+ static int _stp_runtime_contexts_alloc(void)
+ {
+-	int cpu;
++	unsigned int cpu;
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		/* Module init, so in user context, safe to use
+@@ -31,91 +30,67 @@ static int _stp_runtime_contexts_alloc(void)
+ 				    (unsigned long) sizeof (struct context));
+ 			return -ENOMEM;
+ 		}
+-		rcu_assign_pointer(contexts[cpu], c);
++		per_cpu(contexts, cpu) = c;
+ 	}
+ 	return 0;
+ }
+ 
+ /* We should be free of all probes by this time, but for example the timer for
+  * _stp_ctl_work_callback may still be running and looking for contexts.  We
+- * use RCU-sched synchronization to be sure its safe to free them.  */
++ * use _stp_context_stop and a write lock to be sure its safe to free them.  */
+ static void _stp_runtime_contexts_free(void)
+ {
+-	// Note that 'free_contexts' is static because it is
+-	// (probably) too big to fit on a kernel function's stack.
+-	static struct context *free_contexts[NR_CPUS] = { NULL };
+-	int cpu;
++	unsigned long flags;
++	unsigned int cpu;
+ 
+-	/* First, save all the pointers.  */
+-	rcu_read_lock_sched();
+-	for_each_possible_cpu(cpu) {
+-		free_contexts[cpu] = rcu_dereference_sched(contexts[cpu]);
+-	}
+-	rcu_read_unlock_sched();
++	/* Sync to make sure existing readers are done */
++	atomic_set(&_stp_context_stop, 1);
++	write_lock_irqsave(&_stp_context_lock, flags);
++	write_unlock_irqrestore(&_stp_context_lock, flags);
+ 
+-	/* Now clear all pointers to prevent new readers.  */
+-	for_each_possible_cpu(cpu) {
+-		rcu_assign_pointer(contexts[cpu], NULL);
+-	}
+-
+-	/* Sync to make sure existing readers are done.  */
+-	stp_synchronize_sched();
+-
+-	/* Now we can actually free the contexts.  */
+-	for_each_possible_cpu(cpu) {
+-		struct context *c = free_contexts[cpu];
+-		if (c != NULL) {
+-			free_contexts[cpu] = NULL;
+-			_stp_vfree(c);
+-		}
+-	}
++	/* Now we can actually free the contexts */
++	for_each_possible_cpu(cpu)
++		_stp_vfree(per_cpu(contexts, cpu));
+ }
+ 
+ static inline struct context * _stp_runtime_get_context(void)
+ {
+-	// RHBZ1788662 rcu operations are rejected in idle-cpu contexts
+-	// in effect: skip probe if it's in rcu-idle state
+-#if defined(STAPCONF_RCU_IS_WATCHING) || LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0) // linux commit #5c173eb8
+-        if (! rcu_is_watching())
+-		return 0;
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,3,0) // linux commit #9b2e4f18
+-        if (! rcu_is_cpu_idle())
+-		return 0;
+-#else
+-	; // XXX older kernels didn't put tracepoints in idle-cpu
+-#endif
+-	return rcu_dereference_sched(contexts[smp_processor_id()]);
++	if (atomic_read(&_stp_context_stop))
++		return NULL;
++
++	return per_cpu(contexts, smp_processor_id());
+ }
+ 
+ static struct context * _stp_runtime_entryfn_get_context(void)
++	__acquires(&_stp_context_lock)
+ {
+ 	struct context* __restrict__ c = NULL;
+-	preempt_disable ();
++
++	if (!read_trylock(&_stp_context_lock))
++		return NULL;
++
+ 	c = _stp_runtime_get_context();
+ 	if (c != NULL) {
+-		if (atomic_inc_return(&c->busy) == 1) {
+-			// NB: Notice we're not re-enabling preemption
++		if (!atomic_cmpxchg(&c->busy, 0, 1)) {
++			// NB: Notice we're not releasing _stp_context_lock
+ 			// here. We exepect the calling code to call
+ 			// _stp_runtime_entryfn_get_context() and
+ 			// _stp_runtime_entryfn_put_context() as a
+ 			// pair.
+ 			return c;
+ 		}
+-		atomic_dec(&c->busy);
+ 	}
+-	preempt_enable_no_resched();
++	read_unlock(&_stp_context_lock);
+ 	return NULL;
+ }
+ 
+ static inline void _stp_runtime_entryfn_put_context(struct context *c)
++	__releases(&_stp_context_lock)
+ {
+ 	if (c) {
+-		if (c == _stp_runtime_get_context())
+-			atomic_dec(&c->busy);
+-		/* else, warn about bad state? */
+-		preempt_enable_no_resched();
++		atomic_set(&c->busy, 0);
++		read_unlock(&_stp_context_lock);
+ 	}
+-	return;
+ }
+ 
+ static void _stp_runtime_context_wait(void)
+@@ -130,9 +105,13 @@ static void _stp_runtime_context_wait(void)
+ 		int i;
+ 
+ 		holdon = 0;
+-		rcu_read_lock_sched();
++		read_lock(&_stp_context_lock);
++		if (atomic_read(&_stp_context_stop)) {
++			read_unlock(&_stp_context_lock);
++			break;
++		}
+ 		for_each_possible_cpu(i) {
+-			struct context *c = rcu_dereference_sched(contexts[i]);
++			struct context *c = per_cpu(contexts, i);
+ 			if (c != NULL
+ 			    && atomic_read (& c->busy)) {
+ 				holdon = 1;
+@@ -146,7 +125,7 @@ static void _stp_runtime_context_wait(void)
+ 				}
+ 			}
+ 		}
+-		rcu_read_unlock_sched();
++		read_unlock(&_stp_context_lock);
+ 
+ 		/*
+ 		 * Just in case things are really really stuck, a
+commit bb25d64f7b6c98ef2fc8b711f19bd6271866d727
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Tue Dec 1 09:54:07 2020 -0800
+
+    runtime_context: synchronize _stp_context_stop more strictly
+    
+    We're only reading _stp_context_stop while the read lock is held, so we
+    can move the modification of it to inside the write lock to ensure
+    strict memory ordering. As such, it no longer needs to be an atomic_t
+    variable.
+    
+    We also don't need to disable IRQs when holding the write lock because
+    only read_trylock is used from IRQ context, not read_lock, so there's no
+    possibility of a deadlock occurring.
+
+diff --git a/runtime/linux/runtime_context.h b/runtime/linux/runtime_context.h
+index 18566957a..e716e6d39 100644
+--- a/runtime/linux/runtime_context.h
++++ b/runtime/linux/runtime_context.h
+@@ -14,7 +14,7 @@
+ /* Can't use STP_DEFINE_RWLOCK() or this might be replaced with a spin lock */
+ static DEFINE_RWLOCK(_stp_context_lock);
+ static DEFINE_PER_CPU(struct context *, contexts);
+-static atomic_t _stp_context_stop = ATOMIC_INIT(0);
++static bool _stp_context_stop;
+ 
+ static int _stp_runtime_contexts_alloc(void)
+ {
+@@ -40,13 +40,12 @@ static int _stp_runtime_contexts_alloc(void)
+  * use _stp_context_stop and a write lock to be sure its safe to free them.  */
+ static void _stp_runtime_contexts_free(void)
+ {
+-	unsigned long flags;
+ 	unsigned int cpu;
+ 
+ 	/* Sync to make sure existing readers are done */
+-	atomic_set(&_stp_context_stop, 1);
+-	write_lock_irqsave(&_stp_context_lock, flags);
+-	write_unlock_irqrestore(&_stp_context_lock, flags);
++	write_lock(&_stp_context_lock);
++	_stp_context_stop = true;
++	write_unlock(&_stp_context_lock);
+ 
+ 	/* Now we can actually free the contexts */
+ 	for_each_possible_cpu(cpu)
+@@ -55,7 +54,7 @@ static void _stp_runtime_contexts_free(void)
+ 
+ static inline struct context * _stp_runtime_get_context(void)
+ {
+-	if (atomic_read(&_stp_context_stop))
++	if (_stp_context_stop)
+ 		return NULL;
+ 
+ 	return per_cpu(contexts, smp_processor_id());
+@@ -106,7 +105,7 @@ static void _stp_runtime_context_wait(void)
+ 
+ 		holdon = 0;
+ 		read_lock(&_stp_context_lock);
+-		if (atomic_read(&_stp_context_stop)) {
++		if (_stp_context_stop) {
+ 			read_unlock(&_stp_context_lock);
+ 			break;
+ 		}
+commit 0cc239e6f0fff79cb584fc857d3220402558db37
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Tue Dec 1 18:47:04 2020 -0800
+
+    runtime_context: replace _stp_context_lock with an atomic variable
+    
+    We can't use any lock primitives here, such as spin locks or rw locks,
+    because lock_acquire() has tracepoints inside of it. This can cause a
+    deadlock, so we have to roll our own synchronization mechanism using an
+    atomic variable.
+
+diff --git a/runtime/linux/runtime_context.h b/runtime/linux/runtime_context.h
+index e716e6d39..7dd240e1a 100644
+--- a/runtime/linux/runtime_context.h
++++ b/runtime/linux/runtime_context.h
+@@ -11,10 +11,9 @@
+ #ifndef _LINUX_RUNTIME_CONTEXT_H_
+ #define _LINUX_RUNTIME_CONTEXT_H_
+ 
+-/* Can't use STP_DEFINE_RWLOCK() or this might be replaced with a spin lock */
+-static DEFINE_RWLOCK(_stp_context_lock);
++/* Can't use a lock primitive for this because lock_acquire() has tracepoints */
++static atomic_t _stp_contexts_busy_ctr = ATOMIC_INIT(0);
+ static DEFINE_PER_CPU(struct context *, contexts);
+-static bool _stp_context_stop;
+ 
+ static int _stp_runtime_contexts_alloc(void)
+ {
+@@ -37,15 +36,14 @@ static int _stp_runtime_contexts_alloc(void)
+ 
+ /* We should be free of all probes by this time, but for example the timer for
+  * _stp_ctl_work_callback may still be running and looking for contexts.  We
+- * use _stp_context_stop and a write lock to be sure its safe to free them.  */
++ * use _stp_contexts_busy_ctr to be sure its safe to free them.  */
+ static void _stp_runtime_contexts_free(void)
+ {
+ 	unsigned int cpu;
+ 
+ 	/* Sync to make sure existing readers are done */
+-	write_lock(&_stp_context_lock);
+-	_stp_context_stop = true;
+-	write_unlock(&_stp_context_lock);
++	while (atomic_cmpxchg(&_stp_contexts_busy_ctr, 0, INT_MAX))
++		cpu_relax();
+ 
+ 	/* Now we can actually free the contexts */
+ 	for_each_possible_cpu(cpu)
+@@ -54,24 +52,20 @@ static void _stp_runtime_contexts_free(void)
+ 
+ static inline struct context * _stp_runtime_get_context(void)
+ {
+-	if (_stp_context_stop)
+-		return NULL;
+-
+ 	return per_cpu(contexts, smp_processor_id());
+ }
+ 
+ static struct context * _stp_runtime_entryfn_get_context(void)
+-	__acquires(&_stp_context_lock)
+ {
+ 	struct context* __restrict__ c = NULL;
+ 
+-	if (!read_trylock(&_stp_context_lock))
++	if (!atomic_add_unless(&_stp_contexts_busy_ctr, 1, INT_MAX))
+ 		return NULL;
+ 
+ 	c = _stp_runtime_get_context();
+ 	if (c != NULL) {
+ 		if (!atomic_cmpxchg(&c->busy, 0, 1)) {
+-			// NB: Notice we're not releasing _stp_context_lock
++			// NB: Notice we're not releasing _stp_contexts_busy_ctr
+ 			// here. We exepect the calling code to call
+ 			// _stp_runtime_entryfn_get_context() and
+ 			// _stp_runtime_entryfn_put_context() as a
+@@ -79,16 +73,15 @@ static struct context * _stp_runtime_entryfn_get_context(void)
+ 			return c;
+ 		}
+ 	}
+-	read_unlock(&_stp_context_lock);
++	atomic_dec(&_stp_contexts_busy_ctr);
+ 	return NULL;
+ }
+ 
+ static inline void _stp_runtime_entryfn_put_context(struct context *c)
+-	__releases(&_stp_context_lock)
+ {
+ 	if (c) {
+ 		atomic_set(&c->busy, 0);
+-		read_unlock(&_stp_context_lock);
++		atomic_dec(&_stp_contexts_busy_ctr);
+ 	}
+ }
+ 
+@@ -104,11 +97,9 @@ static void _stp_runtime_context_wait(void)
+ 		int i;
+ 
+ 		holdon = 0;
+-		read_lock(&_stp_context_lock);
+-		if (_stp_context_stop) {
+-			read_unlock(&_stp_context_lock);
++		if (!atomic_add_unless(&_stp_contexts_busy_ctr, 1, INT_MAX))
+ 			break;
+-		}
++
+ 		for_each_possible_cpu(i) {
+ 			struct context *c = per_cpu(contexts, i);
+ 			if (c != NULL
+@@ -124,7 +115,7 @@ static void _stp_runtime_context_wait(void)
+ 				}
+ 			}
+ 		}
+-		read_unlock(&_stp_context_lock);
++		atomic_dec(&_stp_contexts_busy_ctr);
+ 
+ 		/*
+ 		 * Just in case things are really really stuck, a
+commit fbab0ea35e6af0d6599c6de3708b24008bf03ae6
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 2 11:07:11 2020 -0800
+
+    runtime_context: disable preempt while holding the context
+    
+    After the context lock was converted to an atomic in the previous
+    commit, the preempt disable logic disappeared. Add it back.
+
+diff --git a/runtime/linux/runtime_context.h b/runtime/linux/runtime_context.h
+index 7dd240e1a..7a1532e54 100644
+--- a/runtime/linux/runtime_context.h
++++ b/runtime/linux/runtime_context.h
+@@ -34,6 +34,24 @@ static int _stp_runtime_contexts_alloc(void)
+ 	return 0;
+ }
+ 
++static bool _stp_runtime_context_trylock(void)
++{
++	bool locked;
++
++	preempt_disable();
++	locked = atomic_add_unless(&_stp_contexts_busy_ctr, 1, INT_MAX);
++	if (!locked)
++		preempt_enable_no_resched();
++
++	return locked;
++}
++
++static void _stp_runtime_context_unlock(void)
++{
++	atomic_dec(&_stp_contexts_busy_ctr);
++	preempt_enable_no_resched();
++}
++
+ /* We should be free of all probes by this time, but for example the timer for
+  * _stp_ctl_work_callback may still be running and looking for contexts.  We
+  * use _stp_contexts_busy_ctr to be sure its safe to free them.  */
+@@ -59,7 +77,7 @@ static struct context * _stp_runtime_entryfn_get_context(void)
+ {
+ 	struct context* __restrict__ c = NULL;
+ 
+-	if (!atomic_add_unless(&_stp_contexts_busy_ctr, 1, INT_MAX))
++	if (!_stp_runtime_context_trylock())
+ 		return NULL;
+ 
+ 	c = _stp_runtime_get_context();
+@@ -73,7 +91,7 @@ static struct context * _stp_runtime_entryfn_get_context(void)
+ 			return c;
+ 		}
+ 	}
+-	atomic_dec(&_stp_contexts_busy_ctr);
++	_stp_runtime_context_unlock();
+ 	return NULL;
+ }
+ 
+@@ -81,7 +99,7 @@ static inline void _stp_runtime_entryfn_put_context(struct context *c)
+ {
+ 	if (c) {
+ 		atomic_set(&c->busy, 0);
+-		atomic_dec(&_stp_contexts_busy_ctr);
++		_stp_runtime_context_unlock();
+ 	}
+ }
+ 
+@@ -97,7 +115,7 @@ static void _stp_runtime_context_wait(void)
+ 		int i;
+ 
+ 		holdon = 0;
+-		if (!atomic_add_unless(&_stp_contexts_busy_ctr, 1, INT_MAX))
++		if (!_stp_runtime_context_trylock())
+ 			break;
+ 
+ 		for_each_possible_cpu(i) {
+@@ -115,7 +133,7 @@ static void _stp_runtime_context_wait(void)
+ 				}
+ 			}
+ 		}
+-		atomic_dec(&_stp_contexts_busy_ctr);
++		_stp_runtime_context_unlock();
+ 
+ 		/*
+ 		 * Just in case things are really really stuck, a
+commit aedc044d5d38cb2fa6144d0a3345d06847862f1b
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 2 11:27:47 2020 -0800
+
+    task_finder_vma: add kfree_rcu() compat for old kernels
+    
+    Newer RHEL 6 kernels have kfree_rcu(), but older ones do not. Using
+    kfree_rcu() is beneficial because it lets the RCU subsystem know that
+    the queued RCU callback is low-priority, and can be deferred, hence why
+    we don't replace kfree_rcu() with call_rcu() outright. Luckily,
+    kfree_rcu() is a macro so we can just #ifdef with it.
+
+diff --git a/runtime/task_finder_vma.c b/runtime/task_finder_vma.c
+index 7f0f6ed56..dc77a80f5 100644
+--- a/runtime/task_finder_vma.c
++++ b/runtime/task_finder_vma.c
+@@ -87,6 +87,15 @@ __stp_tf_vma_new_entry(void)
+ 	return entry;
+ }
+ 
++#ifndef kfree_rcu
++static void __stp_tf_vma_free_entry(struct rcu_head *rcu)
++{
++	struct __stp_tf_vma_entry *entry = container_of(rcu, typeof(*entry), rcu);
++
++	kfree(entry);
++}
++#endif
++
+ // __stp_tf_vma_put_entry(): Put a specified number of references on the entry.
+ static void
+ __stp_tf_vma_put_entry(struct __stp_tf_vma_bucket *bucket,
+@@ -106,7 +115,11 @@ __stp_tf_vma_put_entry(struct __stp_tf_vma_bucket *bucket,
+ 	hlist_del_rcu(&entry->hlist);
+ 	stp_spin_unlock_irqrestore(&bucket->lock, flags);
+ 
++#ifdef kfree_rcu
+ 	kfree_rcu(entry, rcu);
++#else
++	call_rcu(&entry->rcu, __stp_tf_vma_free_entry);
++#endif
+ }
+ 
+ // stap_initialize_vma_map():  Initialize the free list.  Grabs the
+commit 6a27888b118b7a94650a68aae028957cdd5fb5f5
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 2 18:09:17 2020 -0800
+
+    REVERTME: tapset-timers: work around on-the-fly deadlocks caused by mutex_trylock
+    
+    The following deadlock exists due to tracepoints existing inside a lock
+    that is used both inside probe context and outside probe context:
+     #0 [ffff88017f6d7a08] kvm_wait at ffffffff81079f5a
+     #1 [ffff88017f6d7a30] __pv_queued_spin_lock_slowpath at ffffffff8114f51e
+     #2 [ffff88017f6d7a70] queued_spin_lock_slowpath at ffffffff810e842b
+     #3 [ffff88017f6d7a80] mutex_trylock at ffffffff81882b1b
+     #4 [ffff88017f6d7ab8] _stp_transport_trylock_relay_inode at ffffffffc0c599df [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #5 [ffff88017f6d7ad8] __stp_print_flush at ffffffffc09b6483 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #6 [ffff88017f6d7b10] probe_7879 at ffffffffc0a98c85 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #7 [ffff88017f6d7b38] enter_real_tracepoint_probe_1543 at ffffffffc0c3b757 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #8 [ffff88017f6d7b70] enter_tracepoint_probe_1543 at ffffffffc09b117e [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #9 [ffff88017f6d7b80] lock_acquire at ffffffff811460ba
+    #10 [ffff88017f6d7be8] mutex_trylock at ffffffff81882a27
+    #11 [ffff88017f6d7c20] _stp_transport_trylock_relay_inode at ffffffffc0c599df [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+    #12 [ffff88017f6d7c40] __stp_print_flush at ffffffffc09b6483 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+    #13 [ffff88017f6d7c78] _stp_vlog at ffffffffc09b8d32 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+    #14 [ffff88017f6d7cd8] _stp_dbug at ffffffffc09ba43b [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+    #15 [ffff88017f6d7d38] systemtap_module_refresh at ffffffffc09ba51d [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+    #16 [ffff88017f6d7d50] module_refresher at ffffffffc09ba53e [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+    #17 [ffff88017f6d7d60] process_one_work at ffffffff810da9cc
+    #18 [ffff88017f6d7de8] worker_thread at ffffffff810dafe6
+    #19 [ffff88017f6d7e48] kthread at ffffffff810e44cf
+    #20 [ffff88017f6d7f50] ret_from_fork_nospec_begin at ffffffff818958dd
+    
+    Note the deadlock due to _stp_transport_trylock_relay_inode recursing
+    onto itself via mutex_trylock.
+    
+    This is a temporary fix for the issue until a proper patch is made to
+    remove the mutex_trylock from __stp_print_flush. This should be reverted
+    when that patch lands (it will have something to do with bulkmode).
+
+diff --git a/tapset-timers.cxx b/tapset-timers.cxx
+index 10da17cda..503498c85 100644
+--- a/tapset-timers.cxx
++++ b/tapset-timers.cxx
+@@ -391,11 +391,11 @@ hrtimer_derived_probe_group::emit_module_refresh (systemtap_session& s)
+   s.op->newline(+1) <<   "struct stap_hrtimer_probe* stp = &stap_hrtimer_probes[i];";
+   // timer disabled, but condition says enabled?
+   s.op->newline( 0) <<   "if (!stp->enabled && stp->probe->cond_enabled) {";
+-  s.op->newline(+1) <<     "dbug_otf(\"enabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
++  s.op->newline(+1) <<     "//dbug_otf(\"enabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
+   s.op->newline( 0) <<     "_stp_hrtimer_start(stp);";
+   // timer enabled, but condition says disabled?
+   s.op->newline(-1) <<   "} else if (stp->enabled && !stp->probe->cond_enabled) {";
+-  s.op->newline(+1) <<     "dbug_otf(\"disabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
++  s.op->newline(+1) <<     "//dbug_otf(\"disabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
+   s.op->newline( 0) <<     "_stp_hrtimer_cancel(stp);";
+   s.op->newline(-1) <<   "}";
+   s.op->newline( 0) <<   "stp->enabled = stp->probe->cond_enabled;";
+commit 7187dcf39412fcb25c432d318be8e49a6051f055
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Thu Dec 3 12:57:34 2020 -0800
+
+    runtime: fix print races in IRQ context and during print cleanup
+    
+    Prints can race when there's a print called from IRQ context or a print
+    called while print cleanup takes place, which can lead to garbled print
+    messages, out-of-bounds memory accesses, and memory use-after-free. This
+    is one example of racy modification of the print buffer len in IRQ
+    context which caused a panic due to an out-of-bounds memory access:
+    
+    BUG: unable to handle kernel paging request at ffffe8ffff621000
+    IP: [<ffffffffc05da0f3>] _stp_vsprint_memory+0x83/0x950 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+    PGD 174b90067 PUD 174b8f067 PMD 174b93067 PTE 0
+    Oops: 0002 [#1] SMP
+    CPU: 12 PID: 3468 Comm: cat Kdump: loaded Tainted: G           OE  ------------   3.10.0-1127.19.1.el7.x86_64.debug #1
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20180531_142017-buildhw-08.phx2.fedoraproject.org-1.fc28 04/01/2014
+    task: ffff88001f4f0000 ti: ffff88004ea5c000 task.ti: ffff88004ea5c000
+    RIP: 0010:[<ffffffffc05da0f3>]  [<ffffffffc05da0f3>] _stp_vsprint_memory+0x83/0x950 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+    RSP: 0018:ffff88004ea5f9a8  EFLAGS: 00010082
+    RAX: ffffe8ffff621001 RBX: ffffe8ffff620ff2 RCX: fffffffffffffffe
+    RDX: 000000000000006e RSI: ffffffffffffffff RDI: ffffc90002c23730
+    RBP: ffff88004ea5fa28 R08: 00000000ffffffff R09: 0000000000000073
+    R10: ffffc90002c243d7 R11: 0000000000000001 R12: ffffc90002c2373f
+    R13: ffffe8ffff621004 R14: 0000000000000012 R15: 00000000fffffffe
+    FS:  00007f8a9b1d4740(0000) GS:ffff880179e00000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: ffffe8ffff621000 CR3: 00000000b3e3c000 CR4: 0000000000360fe0
+    DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+    Call Trace:
+     [<ffffffff8103eb89>] ? sched_clock+0x9/0x10
+     [<ffffffff8114036f>] ? lock_release_holdtime.part.30+0xf/0x1a0
+     [<ffffffffc05dcb80>] function___global_trace__overload_0+0x5b0/0x1220 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+     [<ffffffffc05d8993>] ? stp_lock_probe+0x53/0xe0 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+     [<ffffffff8188d879>] ? kretprobe_trampoline_holder+0x9/0x9
+     [<ffffffffc05e0662>] probe_7118+0x82/0xe0 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+     [<ffffffffc05de866>] enter_kretprobe_common+0x256/0x490 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+     [<ffffffff813489f1>] ? proc_sys_open+0x51/0x60
+     [<ffffffffc05dead0>] enter_kretprobe_probe+0x10/0x20 [stap_2c44636dfda18135ca3012a752599da6_13_533]
+     [<ffffffff8188e1d8>] trampoline_handler+0x148/0x220
+     [<ffffffff813489f1>] ? proc_sys_open+0x51/0x60
+     [<ffffffff8188d89e>] kretprobe_trampoline+0x25/0x57
+     [<ffffffff813489f1>] ? proc_sys_open+0x51/0x60
+     [<ffffffff8188d879>] kretprobe_trampoline_holder+0x9/0x9
+     [<ffffffff81384702>] ? security_inode_permission+0x22/0x30
+     [<ffffffff813489a0>] ? sysctl_head_finish+0x50/0x50
+     [<ffffffff812ac11d>] vfs_open+0x5d/0xb0
+     [<ffffffff812bb74a>] ? may_open+0x5a/0x120
+     [<ffffffff812c0af5>] do_last+0x285/0x15b0
+     [<ffffffff812bf18e>] ? link_path_walk+0x27e/0x8c0
+     [<ffffffff812c1ef0>] path_openat+0xd0/0x5d0
+     [<ffffffff8107a7f3>] ? kvm_clock_read+0x33/0x40
+     [<ffffffff812c38ad>] do_filp_open+0x4d/0xb0
+     [<ffffffff81889497>] ? _raw_spin_unlock+0x27/0x40
+     [<ffffffff812d5a9b>] ? __alloc_fd+0xfb/0x270
+     [<ffffffff812ad784>] do_sys_open+0x124/0x220
+     [<ffffffff812ad89e>] SyS_open+0x1e/0x20
+     [<ffffffff8188d879>] kretprobe_trampoline_holder+0x9/0x9
+    
+    This patch resolves the IRQ print races by disabling IRQs on the local
+    CPU when accessing said CPU's print buffer, and resolves the cleanup
+    races with a lock. We also protect against data corruption and panics
+    from prints inside NMIs now by checking if the current CPU was accessing
+    the log buffer when an NMI fired; in this case, the NMI's prints will be
+    dropped, as there is no way to safely service them without creating a
+    dedicated log buffer for them. This is achieved by forbidding reentrancy
+    with respect to _stp_print_trylock_irqsave() when the runtime context
+    isn't held. Reentrancy is otherwise allowed when the runtime context is
+    held because the runtime context provides reentrancy protection.
+
+diff --git a/runtime/linux/io.c b/runtime/linux/io.c
+index 74a032c52..122708e2a 100644
+--- a/runtime/linux/io.c
++++ b/runtime/linux/io.c
+@@ -20,9 +20,6 @@
+ 
+ #define WARN_STRING "WARNING: "
+ #define ERR_STRING "ERROR: "
+-#if (STP_LOG_BUF_LEN < 10) /* sizeof(WARN_STRING) */
+-#error "STP_LOG_BUF_LEN is too short"
+-#endif
+ 
+ enum code { INFO=0, WARN, ERROR, DBUG };
+ 
+@@ -31,25 +28,37 @@ static void _stp_vlog (enum code type, const char *func, int line, const char *f
+ 
+ static void _stp_vlog (enum code type, const char *func, int line, const char *fmt, va_list args)
+ {
++	struct _stp_log *log;
++	unsigned long flags;
++	size_t bytes_avail;
+ 	int num;
+-	char *buf = per_cpu_ptr(Stp_lbuf, get_cpu());
++	char *buf;
+ 	int start = 0;
+ 
++	if (!_stp_print_trylock_irqsave(&flags))
++		return;
++
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	bytes_avail = STP_BUFFER_SIZE - log->len;
++	if (unlikely(!bytes_avail))
++		goto err_unlock;
++
++	buf = &log->buf[log->len];
+ 	if (type == DBUG) {
+-		start = _stp_snprintf(buf, STP_LOG_BUF_LEN, "%s:%d: ", func, line);
++		start = _stp_snprintf(buf, bytes_avail, "%s:%d: ", func, line);
+ 	} else if (type == WARN) {
+-		/* This strcpy() is OK, since we know STP_LOG_BUF_LEN
+-		 * is > sizeof(WARN_STRING). */
+-		strcpy (buf, WARN_STRING);
+-		start = sizeof(WARN_STRING) - 1;
++		strncpy(buf, WARN_STRING, bytes_avail);
++		start = min(bytes_avail, sizeof(WARN_STRING) - 1);
+ 	} else if (type == ERROR) {
+-		/* This strcpy() is OK, since we know STP_LOG_BUF_LEN
+-		 * is > sizeof(ERR_STRING) (which is < sizeof(WARN_STRING). */
+-		strcpy (buf, ERR_STRING);
+-		start = sizeof(ERR_STRING) - 1;
++		strncpy(buf, ERR_STRING, bytes_avail);
++		start = min(bytes_avail, sizeof(ERR_STRING) - 1);
+ 	}
+ 
+-	num = vscnprintf (buf + start, STP_LOG_BUF_LEN - start - 1, fmt, args);
++	bytes_avail -= start;
++	if (unlikely(!bytes_avail))
++		goto err_unlock;
++
++	num = vscnprintf(buf + start, bytes_avail - 1, fmt, args);
+ 	if (num + start) {
+ 		if (buf[num + start - 1] != '\n') {
+ 			buf[num + start] = '\n';
+@@ -66,12 +75,13 @@ static void _stp_vlog (enum code type, const char *func, int line, const char *f
+ 		if (type != DBUG) {
+ 			_stp_ctl_send(STP_OOB_DATA, buf, start + num + 1);
+ 		} else {
+-			_stp_print(buf);
+-			_stp_print_flush();
++			log->len += start + num;
++			__stp_print_flush(log);
+ 		}
+ #endif
+ 	}
+-	put_cpu();
++err_unlock:
++	_stp_print_unlock_irqrestore(&flags);
+ }
+ 
+ /** Prints warning.
+diff --git a/runtime/linux/print.c b/runtime/linux/print.c
+index 777bca8b0..2aa2f1c8d 100644
+--- a/runtime/linux/print.c
++++ b/runtime/linux/print.c
+@@ -35,84 +35,179 @@
+  * @{
+  */
+ 
+-typedef struct __stp_pbuf {
+-	uint32_t len;			/* bytes used in the buffer */
++struct _stp_log {
++	unsigned int len; /* Bytes used in the buffer */
+ 	char buf[STP_BUFFER_SIZE];
+-} _stp_pbuf;
++	atomic_t reentrancy_lock;
++};
++#include "print_flush.c"
+ 
+-static void *Stp_pbuf = NULL;
++static struct _stp_log *_stp_log_pcpu;
++
++/*
++ * An atomic counter is used to synchronize every possible print buffer usage
++ * with the _stp_print_cleanup() function. The cleanup function sets the counter
++ * to INT_MAX after waiting for everything using the print buffer to finish. We
++ * cannot use a lock primitive to implement this because lock_acquire() contains
++ * tracepoints and print statements are used both inside and outside of probes.
++ * If the lock were only used inside probes, the runtime context would protect
++ * us from recursing into the lock_acquire() tracepoints and deadlocking. We
++ * instead use _stp_print_ctr as if it were a read-write lock.
++ */
++static atomic_t _stp_print_ctr = ATOMIC_INIT(0);
+ 
+-/** private buffer for _stp_vlog() */
+-#ifndef STP_LOG_BUF_LEN
+-#define STP_LOG_BUF_LEN 256
+-#endif
++/*
++ * This disables IRQs to make per-CPU print buffer accesses atomic. There is a
++ * reentrancy protection mechanism specifically for NMIs, since they can violate
++ * our atomic guarantee. Reentrancy is otherwise allowed within code sections
++ * that have the runtime context held (via _stp_runtime_entryfn_get_context()).
++ */
++static bool _stp_print_trylock_irqsave(unsigned long *flags)
++{
++	bool context_held = false;
++	struct _stp_log *log;
++
++	local_irq_save(*flags);
++	if (!atomic_add_unless(&_stp_print_ctr, 1, INT_MAX))
++		goto irq_restore;
++
++	/*
++	 * Check the per-CPU reentrancy lock for contention, unless the runtime
++	 * context is already held, in which case we already have reentrancy
++	 * protection. Otherwise, if the reentrancy lock is contented, that
++	 * means we're either inside an NMI that fired while the current CPU was
++	 * accessing the log buffer, or something is trying to nest calls to
++	 * _stp_print_trylock_irqsave(). Our only choice is to reject the log
++	 * access attempt in this case because log buffer corruption and panics
++	 * could ensue if we're inside an NMI.
++	 */
++	if (_stp_runtime_context_trylock()) {
++		struct context *c = _stp_runtime_get_context();
++		context_held = c && atomic_read(&c->busy);
++		_stp_runtime_context_unlock();
++	}
+ 
+-typedef char _stp_lbuf[STP_LOG_BUF_LEN];
+-static void *Stp_lbuf = NULL;
++	/* Fall back onto the reentrancy lock if the context isn't held */
++	if (!context_held) {
++		log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++		if (atomic_cmpxchg(&log->reentrancy_lock, 0, 1))
++			goto print_unlock;
++	}
++
++	return true;
++
++print_unlock:
++	atomic_dec(&_stp_print_ctr);
++irq_restore:
++	local_irq_restore(*flags);
++	return false;
++}
++
++static void _stp_print_unlock_irqrestore(unsigned long *flags)
++{
++	bool context_held = false;
++	struct _stp_log *log;
++
++	if (_stp_runtime_context_trylock()) {
++		struct context *c = _stp_runtime_get_context();
++		context_held = c && atomic_read(&c->busy);
++		_stp_runtime_context_unlock();
++	}
++
++	if (!context_held) {
++		log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++		atomic_set(&log->reentrancy_lock, 0);
++	}
++
++	atomic_dec(&_stp_print_ctr);
++	local_irq_restore(*flags);
++}
+ 
+ /* create percpu print and io buffers */
+ static int _stp_print_init (void)
+ {
+-	Stp_pbuf = _stp_alloc_percpu(sizeof(_stp_pbuf));
+-	if (unlikely(Stp_pbuf == 0))
+-		return -1;
+-
+-	/* now initialize IO buffer used in io.c */
+-	Stp_lbuf = _stp_alloc_percpu(sizeof(_stp_lbuf));
+-	if (unlikely(Stp_lbuf == 0)) {
+-		_stp_free_percpu(Stp_pbuf);
+-		return -1;
++	unsigned int cpu;
++
++	_stp_log_pcpu = _stp_alloc_percpu(sizeof(*_stp_log_pcpu));
++	if (!_stp_log_pcpu)
++		return -ENOMEM;
++
++	for_each_possible_cpu(cpu) {
++		struct _stp_log *log = per_cpu_ptr(_stp_log_pcpu, cpu);
++
++		log->reentrancy_lock = (atomic_t)ATOMIC_INIT(0);
+ 	}
+ 	return 0;
+ }
+ 
+ static void _stp_print_cleanup (void)
+ {
+-	if (Stp_pbuf)
+-		_stp_free_percpu(Stp_pbuf);
+-	if (Stp_lbuf)
+-		_stp_free_percpu(Stp_lbuf);
+-}
++	unsigned int cpu;
+ 
+-#include "print_flush.c"
++	/* Wait for the loggers to finish modifying the print buffers */
++	while (atomic_cmpxchg(&_stp_print_ctr, 0, INT_MAX))
++		cpu_relax();
++
++	for_each_possible_cpu(cpu) {
++		struct _stp_log *log = per_cpu_ptr(_stp_log_pcpu, cpu);
++
++		/*
++		 * Flush anything that could be left in the print buffer. It is
++		 * safe to do this without any kind of synchronization mechanism
++		 * because nothing is using this print buffer anymore.
++		 */
++		__stp_print_flush(log);
++	}
++
++	_stp_free_percpu(_stp_log_pcpu);
++}
+ 
+ static inline void _stp_print_flush(void)
+ {
+-	stp_print_flush(per_cpu_ptr(Stp_pbuf, smp_processor_id()));
++	struct _stp_log *log;
++	unsigned long flags;
++
++	if (!_stp_print_trylock_irqsave(&flags))
++		return;
++
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	__stp_print_flush(log);
++	_stp_print_unlock_irqrestore(&flags);
+ }
++
+ #ifndef STP_MAXBINARYARGS
+ #define STP_MAXBINARYARGS 127
+ #endif
+ 
+ 
+-/** Reserves space in the output buffer for direct I/O.
++/** Reserves space in the output buffer for direct I/O. Must be called with
++ * _stp_print_trylock_irqsave() held.
+  */
+ static void * _stp_reserve_bytes (int numbytes)
+ {
+-	_stp_pbuf *pb = per_cpu_ptr(Stp_pbuf, smp_processor_id());
+-	int size = STP_BUFFER_SIZE - pb->len;
+-	void * ret;
++	struct _stp_log *log;
++	char *ret;
+ 
+ 	if (unlikely(numbytes == 0 || numbytes > STP_BUFFER_SIZE))
+ 		return NULL;
+ 
+-	if (unlikely(numbytes > size))
+-		_stp_print_flush();
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	if (unlikely(numbytes > (STP_BUFFER_SIZE - log->len)))
++		__stp_print_flush(log);
+ 
+-	ret = pb->buf + pb->len;
+-	pb->len += numbytes;
++	ret = &log->buf[log->len];
++	log->len += numbytes;
+ 	return ret;
+ }
+ 
+ 
+ static void _stp_unreserve_bytes (int numbytes)
+ {
+-	_stp_pbuf *pb = per_cpu_ptr(Stp_pbuf, smp_processor_id());
+-
+-	if (unlikely(numbytes == 0 || numbytes > pb->len))
+-		return;
++	struct _stp_log *log;
+ 
+-	pb->len -= numbytes;
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	if (numbytes <= log->len)
++		log->len -= numbytes;
+ }
+ 
+ /** Write 64-bit args directly into the output stream.
+@@ -123,22 +218,25 @@ static void _stp_unreserve_bytes (int numbytes)
+  */
+ static void _stp_print_binary (int num, ...)
+ {
++	unsigned long flags;
+ 	va_list vargs;
+ 	int i;
+ 	int64_t *args;
+-	
++
+ 	if (unlikely(num > STP_MAXBINARYARGS))
+ 		num = STP_MAXBINARYARGS;
+ 
+-	args = _stp_reserve_bytes(num * sizeof(int64_t));
++	if (!_stp_print_trylock_irqsave(&flags))
++		return;
+ 
+-	if (likely(args != NULL)) {
++	args = _stp_reserve_bytes(num * sizeof(int64_t));
++	if (args) {
+ 		va_start(vargs, num);
+-		for (i = 0; i < num; i++) {
++		for (i = 0; i < num; i++)
+ 			args[i] = va_arg(vargs, int64_t);
+-		}
+ 		va_end(vargs);
+ 	}
++	_stp_print_unlock_irqrestore(&flags);
+ }
+ 
+ /** Print into the print buffer.
+@@ -149,6 +247,7 @@ static void _stp_print_binary (int num, ...)
+ static void _stp_printf (const char *fmt, ...)
+ {
+ 	va_list args;
++
+ 	va_start(args, fmt);
+ 	_stp_vsnprintf(NULL, 0, fmt, args);
+ 	va_end(args);
+@@ -160,37 +259,36 @@ static void _stp_printf (const char *fmt, ...)
+ 
+ static void _stp_print (const char *str)
+ {
+-	_stp_pbuf *pb = per_cpu_ptr(Stp_pbuf, smp_processor_id());
+-	char *end = pb->buf + STP_BUFFER_SIZE;
+-	char *ptr = pb->buf + pb->len;
+-	char *instr = (char *)str;
+-
+-	while (ptr < end && *instr)
+-		*ptr++ = *instr++;
+-
+-	/* Did loop terminate due to lack of buffer space? */
+-	if (unlikely(*instr)) {
+-		/* Don't break strings across subbufs. */
+-		/* Restart after flushing. */
+-		_stp_print_flush();
+-		end = pb->buf + STP_BUFFER_SIZE;
+-		ptr = pb->buf + pb->len;
+-		instr = (char *)str;
+-		while (ptr < end && *instr)
+-			*ptr++ = *instr++;
++	struct _stp_log *log;
++	unsigned long flags;
++
++	if (!_stp_print_trylock_irqsave(&flags))
++		return;
++
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	while (1) {
++		while (log->len < STP_BUFFER_SIZE && *str)
++			log->buf[log->len++] = *str++;
++		if (likely(!*str))
++			break;
++		__stp_print_flush(log);
+ 	}
+-	pb->len = ptr - pb->buf;
++	_stp_print_unlock_irqrestore(&flags);
+ }
+ 
+ static void _stp_print_char (const char c)
+ {
+-	_stp_pbuf *pb = per_cpu_ptr(Stp_pbuf, smp_processor_id());
+-	int size = STP_BUFFER_SIZE - pb->len;
+-	if (unlikely(1 >= size))
+-		_stp_print_flush();
+-	
+-	pb->buf[pb->len] = c;
+-	pb->len ++;
++	struct _stp_log *log;
++	unsigned long flags;
++
++	if (!_stp_print_trylock_irqsave(&flags))
++		return;
++
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	if (unlikely(log->len == STP_BUFFER_SIZE))
++		__stp_print_flush(log);
++	log->buf[log->len++] = c;
++	_stp_print_unlock_irqrestore(&flags);
+ }
+ 
+ static void _stp_print_kernel_info(char *sname, char *vstr, int ctx, int num_probes)
+diff --git a/runtime/print.h b/runtime/print.h
+index ede71f033..ffdea594d 100644
+--- a/runtime/print.h
++++ b/runtime/print.h
+@@ -10,6 +10,9 @@
+ #ifndef _STP_PRINT_H_
+ #define _STP_PRINT_H_
+ 
++/* The lock must be held with IRQs disabled to do any printing */
++static bool _stp_print_trylock_irqsave(unsigned long *flags);
++static void _stp_print_unlock_irqrestore(unsigned long *flags);
+ static int _stp_print_init(void);
+ static void _stp_print_cleanup(void);
+ static void *_stp_reserve_bytes(int numbytes);
+diff --git a/runtime/print_flush.c b/runtime/print_flush.c
+index cf40a2645..acd6a32d9 100644
+--- a/runtime/print_flush.c
++++ b/runtime/print_flush.c
+@@ -13,40 +13,31 @@
+  * is filled, or this is called. This MUST be called before returning
+  * from a probe or accumulated output in the print buffer will be lost.
+  *
+- * @note Preemption must be disabled to use this.
++ * @note Interrupts must be disabled to use this.
+  */
+ 
+-static STP_DEFINE_SPINLOCK(_stp_print_lock);
+-
+-void stp_print_flush(_stp_pbuf *pb)
++static void __stp_print_flush(struct _stp_log *log)
+ {
+-	size_t len = pb->len;
++	size_t len = log->len;
+ 	void *entry = NULL;
+ 
+ 	/* check to see if there is anything in the buffer */
+ 	if (likely(len == 0))
+ 		return;
+ 
+-	pb->len = 0;
+-
+-	if (unlikely(_stp_transport_get_state() != STP_TRANSPORT_RUNNING))
+-		return;
++	log->len = 0;
+ 
+ 	dbug_trans(1, "len = %zu\n", len);
+ 
+ #ifdef STP_BULKMODE
+ #ifdef NO_PERCPU_HEADERS
+ 	{
+-		struct context* __restrict__ c = NULL;
+-		char *bufp = pb->buf;
++		char *bufp = log->buf;
+ 		int inode_locked;
+ 
+-		c = _stp_runtime_entryfn_get_context();
+-
+ 		if (!(inode_locked = _stp_transport_trylock_relay_inode())) {
+ 			atomic_inc (&_stp_transport_failures);
+ #ifndef STP_TRANSPORT_RISKY
+-			_stp_runtime_entryfn_put_context(c);
+ 			return;
+ #endif
+ 		}
+@@ -70,26 +61,20 @@ void stp_print_flush(_stp_pbuf *pb)
+ 
+ 		if (inode_locked)
+ 			_stp_transport_unlock_relay_inode();
+-
+-		_stp_runtime_entryfn_put_context(c);
+ 	}
+ 
+ #else  /* !NO_PERCPU_HEADERS */
+ 
+ 	{
+-		struct context* __restrict__ c = NULL;
+-		char *bufp = pb->buf;
++		char *bufp = log->buf;
+ 		struct _stp_trace t = {	.sequence = _stp_seq_inc(),
+ 					.pdu_len = len};
+ 		size_t bytes_reserved;
+ 		int inode_locked;
+ 
+-		c = _stp_runtime_entryfn_get_context();
+-
+ 		if (!(inode_locked = _stp_transport_trylock_relay_inode())) {
+ 			atomic_inc (&_stp_transport_failures);
+ #ifndef STP_TRANSPORT_RISKY
+-			_stp_runtime_entryfn_put_context(c);
+ 			return;
+ #endif
+ 		}
+@@ -124,48 +109,24 @@ void stp_print_flush(_stp_pbuf *pb)
+ 
+ 		if (inode_locked)
+ 			_stp_transport_unlock_relay_inode();
+-
+-		_stp_runtime_entryfn_put_context(c);
+ 	}
+ #endif /* !NO_PERCPU_HEADERS */
+ 
+ #else  /* !STP_BULKMODE */
+ 
+ 	{
+-		unsigned long flags;
+-		struct context* __restrict__ c = NULL;
+-		char *bufp = pb->buf;
++		char *bufp = log->buf;
+ 		int inode_locked;
+ 
+-		/* Prevent probe reentrancy on _stp_print_lock.
+-		 *
+-		 * Since stp_print_flush may be called from probe context, we
+-		 * have to make sure that its lock, _stp_print_lock, can't
+-		 * possibly be held outside probe context too.  We ensure this
+-		 * by grabbing the context here, so any probe triggered by this
+-		 * region will appear reentrant and be skipped rather than
+-		 * deadlock.  Failure to get_context just means we're already
+-		 * in a probe, which is fine.
+-		 *
+-		 * (see also _stp_ctl_send for a similar situation)
+-                 *
+-                 * A better solution would be to replace this
+-                 * concurrency-control-laden effort with a lockless
+-                 * algorithm.
+-		 */
+-		c = _stp_runtime_entryfn_get_context();
+-
+ 		if (!(inode_locked = _stp_transport_trylock_relay_inode())) {
+ 			atomic_inc (&_stp_transport_failures);
+ #ifndef STP_TRANSPORT_RISKY
+ 			dbug_trans(0, "discarding %zu bytes of data\n", len);
+-			_stp_runtime_entryfn_put_context(c);
+ 			return;
+ #endif
+ 		}
+ 
+ 		dbug_trans(1, "calling _stp_data_write...\n");
+-		stp_spin_lock_irqsave(&_stp_print_lock, flags);
+ 		while (len > 0) {
+ 			size_t bytes_reserved;
+ 
+@@ -182,12 +143,9 @@ void stp_print_flush(_stp_pbuf *pb)
+ 			    break;
+ 			}
+ 		}
+-		stp_spin_unlock_irqrestore(&_stp_print_lock, flags);
+ 
+ 		if (inode_locked)
+ 			_stp_transport_unlock_relay_inode();
+-
+-		_stp_runtime_entryfn_put_context(c);
+ 	}
+ #endif /* !STP_BULKMODE */
+ }
+diff --git a/runtime/stack.c b/runtime/stack.c
+index 241ccf793..da23d4395 100644
+--- a/runtime/stack.c
++++ b/runtime/stack.c
+@@ -690,13 +690,20 @@ static void _stp_stack_kernel_sprint(char *str, int size, struct context* c,
+ 	 * then call _stp_stack_print,
+ 	 * then copy the result into the output string
+ 	 * and clear the print buffer. */
+-	_stp_pbuf *pb = per_cpu_ptr(Stp_pbuf, smp_processor_id());
+-	_stp_print_flush();
++	struct _stp_log *log;
++	unsigned long flags;
+ 
+-	_stp_stack_kernel_print(c, sym_flags);
++	if (!_stp_print_trylock_irqsave(&flags)) {
++		*str = '\0';
++		return;
++	}
+ 
+-	strlcpy(str, pb->buf, size < (int)pb->len ? size : (int)pb->len);
+-	pb->len = 0;
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	__stp_print_flush(log);
++	_stp_stack_kernel_print(c, sym_flags);
++	strlcpy(str, log->buf, min_t(int, size, log->len));
++	log->len = 0;
++	_stp_print_unlock_irqrestore(&flags);
+ }
+ 
+ static void _stp_stack_user_sprint(char *str, int size, struct context* c,
+@@ -707,13 +714,20 @@ static void _stp_stack_user_sprint(char *str, int size, struct context* c,
+ 	 * then call _stp_stack_print,
+ 	 * then copy the result into the output string
+ 	 * and clear the print buffer. */
+-	_stp_pbuf *pb = per_cpu_ptr(Stp_pbuf, smp_processor_id());
+-	_stp_print_flush();
++	struct _stp_log *log;
++	unsigned long flags;
+ 
+-	_stp_stack_user_print(c, sym_flags);
++	if (!_stp_print_trylock_irqsave(&flags)) {
++		*str = '\0';
++		return;
++	}
+ 
+-	strlcpy(str, pb->buf, size < (int)pb->len ? size : (int)pb->len);
+-	pb->len = 0;
++	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
++	__stp_print_flush(log);
++	_stp_stack_user_print(c, sym_flags);
++	strlcpy(str, log->buf, min_t(int, size, log->len));
++	log->len = 0;
++	_stp_print_unlock_irqrestore(&flags);
+ }
+ 
+ #endif /* _STACK_C_ */
+diff --git a/runtime/transport/transport.c b/runtime/transport/transport.c
+index 57955334b..44e69b68c 100644
+--- a/runtime/transport/transport.c
++++ b/runtime/transport/transport.c
+@@ -540,8 +540,8 @@ static void _stp_transport_close(void)
+ 		   current->pid);
+ 	_stp_cleanup_and_exit(0);
+ 	_stp_unregister_ctl_channel();
++	_stp_print_cleanup(); /* Requires the transport, so free this first */
+ 	_stp_transport_fs_close();
+-	_stp_print_cleanup();	/* free print buffers */
+ 	_stp_mem_debug_done();
+ 
+ 	dbug_trans(1, "---- CLOSED ----\n");
+diff --git a/runtime/vsprintf.c b/runtime/vsprintf.c
+index 28fd18f16..417d9f7f3 100644
+--- a/runtime/vsprintf.c
++++ b/runtime/vsprintf.c
+@@ -542,6 +542,8 @@ _stp_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+ 				   number of chars for from string */
+ 	int qualifier;		/* 'h', 'l', or 'L' for integer fields */
+ 	int num_bytes = 0;
++	unsigned long irqflags = 0;
++	bool got_print_lock = false;
+ 
+ 	/* Reject out-of-range values early */
+ 	if (unlikely((int) size < 0))
+@@ -724,11 +726,14 @@ _stp_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+ 	    num_bytes = STP_BUFFER_SIZE;
+ 	  }
+ 
++	  if (!_stp_print_trylock_irqsave(&irqflags))
++	    return 0;
+ 	  str = (char*)_stp_reserve_bytes(num_bytes);
+ 	  if (str == NULL) {
+ 	    _stp_error("Couldn't reserve any print buffer space\n");
+-	    return 0;
++	    goto err_unlock;
+ 	  }
++	  got_print_lock = true;
+ 	  size = num_bytes;
+ 	  end = str + size - 1;
+ 
+@@ -820,8 +825,10 @@ _stp_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+ 					field_width, precision,
+ 					*fmt, flags);
+ 			if (unlikely(str == NULL)) {
+-				if (num_bytes > 0)
++				if (num_bytes > 0) {
+ 					_stp_unreserve_bytes(num_bytes);
++					goto err_unlock;
++				}
+ 				return 0;
+ 			}
+ 			continue;
+@@ -923,7 +930,14 @@ _stp_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+                   /* don't write out a null byte if the buf size is zero */
+                   *end = '\0';
+ 	}
++
++	if (got_print_lock)
++		_stp_print_unlock_irqrestore(&irqflags);
+ 	return str-buf;
++
++err_unlock:
++	_stp_print_unlock_irqrestore(&irqflags);
++	return 0;
+ }
+ 
+ #endif /* _VSPRINTF_C_ */
+diff --git a/translate.cxx b/translate.cxx
+index 53f1d0725..f0195486c 100644
+--- a/translate.cxx
++++ b/translate.cxx
+@@ -1354,6 +1354,9 @@ c_unparser::emit_compiled_printfs ()
+       o->newline() << "unsigned long ptr_value;";
+       o->newline() << "int num_bytes;";
+ 
++      if (print_to_stream)
++	  o->newline() << "unsigned long irqflags;";
++
+       o->newline() << "(void) width;";
+       o->newline() << "(void) precision;";
+       o->newline() << "(void) ptr_value;";
+@@ -1452,7 +1455,9 @@ c_unparser::emit_compiled_printfs ()
+ 	    }
+ 
+ 	  o->newline() << "num_bytes = clamp(num_bytes, 0, STP_BUFFER_SIZE);";
+-	  o->newline() << "str = (char*)_stp_reserve_bytes(num_bytes);";
++	  o->newline() << "if (!_stp_print_trylock_irqsave(&irqflags))";
++	  o->newline(1) << "return;";
++	  o->newline(-1) << "str = (char*)_stp_reserve_bytes(num_bytes);";
+ 	  o->newline() << "end = str ? str + num_bytes - 1 : 0;";
+         }
+       else // !print_to_stream
+@@ -1547,8 +1552,14 @@ c_unparser::emit_compiled_printfs ()
+ 	      o->newline() << "if (unlikely(str == NULL)) {";
+ 	      o->indent(1);
+ 	      if (print_to_stream)
++                {
+ 		  o->newline() << "_stp_unreserve_bytes(num_bytes);";
+-	      o->newline() << "return;";
++	          o->newline() << "goto err_unlock;";
++                }
++              else
++                {
++	          o->newline() << "return;";
++                }
+ 	      o->newline(-1) << "}";
+ 	      break;
+ 
+@@ -1575,6 +1586,11 @@ c_unparser::emit_compiled_printfs ()
+ 
+       o->newline(-1) << "}";
+ 
++      if (print_to_stream)
++        {
++          o->newline(-1) << "err_unlock:";
++          o->newline(1) << "_stp_print_unlock_irqrestore(&irqflags);";
++        }
+       o->newline(-1) << "}";
+     }
+   o->newline() << "#endif // STP_LEGACY_PRINT";
+commit e8c7a2067ec7fc6315ee9bc34a010ec5f0369c5c
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Fri Dec 4 19:33:22 2020 -0500
+
+    testsuite pr14536.stp: toughen
+    
+    This test case stresses nesting of heavy duty processing (backtrace
+    printing) within kernel interrupt processing paths.  It seems to
+    sometimes trigger problems - so let's make the test harder to make
+    latent problems show up more likely.  Instead of quitting after the
+    first irq_* function hit, stick around for 10 seconds.
+
+diff --git a/testsuite/systemtap.base/pr14546.stp b/testsuite/systemtap.base/pr14546.stp
+index 3e59a6f3a..e4c205a8f 100644
+--- a/testsuite/systemtap.base/pr14546.stp
++++ b/testsuite/systemtap.base/pr14546.stp
+@@ -2,5 +2,6 @@ probe kernel.function("irq_*").call {
+       x = 10; y = 10; z = 10; w = 10
+       $1
+       assert(!(x != 10 || y != 10 || z != 10 || w != 10), "memory got corrupted by " . @1)
+-      exit()
+ }
++
++probe timer.s(10) { exit () }
+commit cd6399e621646856824ea96b11605a0f52011272
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Fri Dec 4 21:33:21 2020 -0500
+
+    dyninst transport: add _stp_print_*lock_irq* stubs
+    
+    Recent code on the transport/linux side needs a few new (stub)
+    functions and type decls.
+
+diff --git a/runtime/dyninst/print.c b/runtime/dyninst/print.c
+index 9d91224ba..c78def272 100644
+--- a/runtime/dyninst/print.c
++++ b/runtime/dyninst/print.c
+@@ -107,4 +107,18 @@ static void _stp_print_char (const char c)
+ 	}
+ }
+ 
++
++/* no-op stub synchronization */
++static bool _stp_print_trylock_irqsave(unsigned long *flags)
++{
++        (void) flags;
++        return true;
++}
++
++static void _stp_print_unlock_irqrestore(unsigned long *flags)
++{
++        (void) flags;
++}
++
++
+ #endif /* _STAPDYN_PRINT_C_ */
+diff --git a/runtime/dyninst/runtime_defines.h b/runtime/dyninst/runtime_defines.h
+index 5c3dec519..d00c76a21 100644
+--- a/runtime/dyninst/runtime_defines.h
++++ b/runtime/dyninst/runtime_defines.h
+@@ -7,3 +7,6 @@
+ #define STAPCONF_PAGEFAULT_DISABLE  1
+ #define pagefault_disable()
+ #define pagefault_enable()
++
++typedef int bool;
++enum { false=0, true=1 };
+commit fd93cf71df80f7bb5aae707ea5a5875727a85770
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 9 12:55:10 2020 -0800
+
+    PR26844: fix off-by-one error when copying printed backtraces
+    
+    Since log->buf isn't null-terminated, log->len represents the total
+    number of bytes present in the log buffer for copying. The use of
+    strlcpy() here with log->len as its size results in log->len - 1 bytes
+    being copied, with the log->len'nth byte of the output buffer being set
+    to zero to terminate the string. Use memcpy() instead to remedy this,
+    while ensuring that the output buffer has space for null termination,
+    since the output buffer needs to be terminated.
+
+diff --git a/runtime/stack.c b/runtime/stack.c
+index da23d4395..85883d6c4 100644
+--- a/runtime/stack.c
++++ b/runtime/stack.c
+@@ -692,6 +692,7 @@ static void _stp_stack_kernel_sprint(char *str, int size, struct context* c,
+ 	 * and clear the print buffer. */
+ 	struct _stp_log *log;
+ 	unsigned long flags;
++	int bytes;
+ 
+ 	if (!_stp_print_trylock_irqsave(&flags)) {
+ 		*str = '\0';
+@@ -701,7 +702,9 @@ static void _stp_stack_kernel_sprint(char *str, int size, struct context* c,
+ 	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
+ 	__stp_print_flush(log);
+ 	_stp_stack_kernel_print(c, sym_flags);
+-	strlcpy(str, log->buf, min_t(int, size, log->len));
++	bytes = min_t(int, size - 1, log->len);
++	memcpy(str, log->buf, bytes);
++	str[bytes] = '\0';
+ 	log->len = 0;
+ 	_stp_print_unlock_irqrestore(&flags);
+ }
+@@ -716,6 +719,7 @@ static void _stp_stack_user_sprint(char *str, int size, struct context* c,
+ 	 * and clear the print buffer. */
+ 	struct _stp_log *log;
+ 	unsigned long flags;
++	int bytes;
+ 
+ 	if (!_stp_print_trylock_irqsave(&flags)) {
+ 		*str = '\0';
+@@ -725,7 +729,9 @@ static void _stp_stack_user_sprint(char *str, int size, struct context* c,
+ 	log = per_cpu_ptr(_stp_log_pcpu, raw_smp_processor_id());
+ 	__stp_print_flush(log);
+ 	_stp_stack_user_print(c, sym_flags);
+-	strlcpy(str, log->buf, min_t(int, size, log->len));
++	bytes = min_t(int, size - 1, log->len);
++	memcpy(str, log->buf, bytes);
++	str[bytes] = '\0';
+ 	log->len = 0;
+ 	_stp_print_unlock_irqrestore(&flags);
+ }
+commit 8819e2a04596deb2fe427d261bebcaf3d2620dfb
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 9 17:22:20 2020 -0800
+
+    always use per-cpu bulkmode relayfs files to communicate with userspace
+    
+    Using a mutex_trylock() in __stp_print_flush() leads to a lot of havoc,
+    for numerous. Firstly, since __stp_print_flush() can be called from IRQ
+    context, holding the inode mutex from here would make the mutex owner
+    become nonsense, since mutex locks can only be held in contexts backed
+    by the scheduler. Secondly, the mutex_trylock implementation has a
+    spin_lock() inside of it that leads to two issues: IRQs aren't disabled
+    when acquiring this spin_lock(), so using it from IRQ context can lead
+    to a deadlock, and since spin locks can have tracepoints via
+    lock_acquire(), the spin_lock() can recurse on itself inside a stap
+    probe and deadlock, like so:
+    
+     #0 [ffff88017f6d7a08] kvm_wait at ffffffff81079f5a
+     #1 [ffff88017f6d7a30] __pv_queued_spin_lock_slowpath at ffffffff8114f51e
+     #2 [ffff88017f6d7a70] queued_spin_lock_slowpath at ffffffff810e842b
+     #3 [ffff88017f6d7a80] mutex_trylock at ffffffff81882b1b
+     #4 [ffff88017f6d7ab8] _stp_transport_trylock_relay_inode at ffffffffc0c599df [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #5 [ffff88017f6d7ad8] __stp_print_flush at ffffffffc09b6483 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #6 [ffff88017f6d7b10] probe_7879 at ffffffffc0a98c85 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #7 [ffff88017f6d7b38] enter_real_tracepoint_probe_1543 at ffffffffc0c3b757 [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #8 [ffff88017f6d7b70] enter_tracepoint_probe_1543 at ffffffffc09b117e [stap_47650d3377d05db0ab7cbbaa25765809__11657]
+     #9 [ffff88017f6d7b80] lock_acquire at ffffffff811460ba
+    
+    The reason the mutex_trylock() was needed in the first place was because
+    staprun doesn't properly use the relayfs API when reading buffers in
+    non-bulk mode. It tries to read all CPUs' buffers from a single thread,
+    when it should be reading each CPU's buffer from a thread running on
+    said CPU in order to utilize relayfs' synchronization guarantees, which
+    are made by disabling IRQs on the local CPU when a buffer is modified.
+    
+    This change makes staprun always use per-CPU threads to read print
+    buffers so that we don't need the mutex_trylock() in the print flush
+    routine, which resolves a wide variety of serious bugs.
+    
+    We also need to adjust the transport sub-buffer count to accommodate for
+    frequent print flushing. The sub-buffer size is now reduced to match the
+    log buffer size, which is 8192 by default, and the number of sub-buffers
+    is increased to 256. This uses exactly the same amount of memory as
+    before.
+
+diff --git a/runtime/print_flush.c b/runtime/print_flush.c
+index acd6a32d9..f4d72d30f 100644
+--- a/runtime/print_flush.c
++++ b/runtime/print_flush.c
+@@ -18,6 +18,7 @@
+ 
+ static void __stp_print_flush(struct _stp_log *log)
+ {
++	char *bufp = log->buf;
+ 	size_t len = log->len;
+ 	void *entry = NULL;
+ 
+@@ -26,126 +27,20 @@ static void __stp_print_flush(struct _stp_log *log)
+ 		return;
+ 
+ 	log->len = 0;
+-
+ 	dbug_trans(1, "len = %zu\n", len);
+-
+-#ifdef STP_BULKMODE
+-#ifdef NO_PERCPU_HEADERS
+-	{
+-		char *bufp = log->buf;
+-		int inode_locked;
+-
+-		if (!(inode_locked = _stp_transport_trylock_relay_inode())) {
+-			atomic_inc (&_stp_transport_failures);
+-#ifndef STP_TRANSPORT_RISKY
+-			return;
+-#endif
+-		}
+-
+-		while (len > 0) {
+-			size_t bytes_reserved;
+-
+-			bytes_reserved = _stp_data_write_reserve(len, &entry);
+-			if (likely(entry && bytes_reserved > 0)) {
+-				memcpy(_stp_data_entry_data(entry), bufp,
+-				       bytes_reserved);
+-				_stp_data_write_commit(entry);
+-				bufp += bytes_reserved;
+-				len -= bytes_reserved;
+-			}
+-			else {
+-				atomic_inc(&_stp_transport_failures);
+-				break;
+-			}
+-		}
+-
+-		if (inode_locked)
+-			_stp_transport_unlock_relay_inode();
+-	}
+-
+-#else  /* !NO_PERCPU_HEADERS */
+-
+-	{
+-		char *bufp = log->buf;
+-		struct _stp_trace t = {	.sequence = _stp_seq_inc(),
+-					.pdu_len = len};
++	do {
+ 		size_t bytes_reserved;
+-		int inode_locked;
+ 
+-		if (!(inode_locked = _stp_transport_trylock_relay_inode())) {
+-			atomic_inc (&_stp_transport_failures);
+-#ifndef STP_TRANSPORT_RISKY
+-			return;
+-#endif
+-		}
+-
+-		bytes_reserved = _stp_data_write_reserve(sizeof(struct _stp_trace), &entry);
+-		if (likely(entry && bytes_reserved > 0)) {
+-			/* prevent unaligned access by using memcpy() */
+-			memcpy(_stp_data_entry_data(entry), &t, sizeof(t));
++		bytes_reserved = _stp_data_write_reserve(len, &entry);
++		if (likely(entry && bytes_reserved)) {
++			memcpy(_stp_data_entry_data(entry), bufp,
++			       bytes_reserved);
+ 			_stp_data_write_commit(entry);
+-		}
+-		else {
++			bufp += bytes_reserved;
++			len -= bytes_reserved;
++		} else {
+ 			atomic_inc(&_stp_transport_failures);
+-			goto done;
++			break;
+ 		}
+-
+-		while (len > 0) {
+-			bytes_reserved = _stp_data_write_reserve(len, &entry);
+-			if (likely(entry && bytes_reserved > 0)) {
+-				memcpy(_stp_data_entry_data(entry), bufp,
+-				       bytes_reserved);
+-				_stp_data_write_commit(entry);
+-				bufp += bytes_reserved;
+-				len -= bytes_reserved;
+-			}
+-			else {
+-				atomic_inc(&_stp_transport_failures);
+-				break;
+-			}
+-		}
+-
+-	done:
+-
+-		if (inode_locked)
+-			_stp_transport_unlock_relay_inode();
+-	}
+-#endif /* !NO_PERCPU_HEADERS */
+-
+-#else  /* !STP_BULKMODE */
+-
+-	{
+-		char *bufp = log->buf;
+-		int inode_locked;
+-
+-		if (!(inode_locked = _stp_transport_trylock_relay_inode())) {
+-			atomic_inc (&_stp_transport_failures);
+-#ifndef STP_TRANSPORT_RISKY
+-			dbug_trans(0, "discarding %zu bytes of data\n", len);
+-			return;
+-#endif
+-		}
+-
+-		dbug_trans(1, "calling _stp_data_write...\n");
+-		while (len > 0) {
+-			size_t bytes_reserved;
+-
+-			bytes_reserved = _stp_data_write_reserve(len, &entry);
+-			if (likely(entry && bytes_reserved > 0)) {
+-				memcpy(_stp_data_entry_data(entry), bufp,
+-				       bytes_reserved);
+-				_stp_data_write_commit(entry);
+-				bufp += bytes_reserved;
+-				len -= bytes_reserved;
+-			}
+-			else {
+-			    atomic_inc(&_stp_transport_failures);
+-			    break;
+-			}
+-		}
+-
+-		if (inode_locked)
+-			_stp_transport_unlock_relay_inode();
+-	}
+-#endif /* !STP_BULKMODE */
++	} while (len > 0);
+ }
+diff --git a/runtime/transport/relay_v2.c b/runtime/transport/relay_v2.c
+index ff621f71d..2ba5eea7d 100644
+--- a/runtime/transport/relay_v2.c
++++ b/runtime/transport/relay_v2.c
+@@ -67,7 +67,7 @@ static size_t __stp_relay_switch_subbuf(struct rchan_buf *buf, size_t length)
+ 		return 0;
+ 
+ 	if (unlikely(length > buf->chan->subbuf_size))
+-		goto toobig;
++		length = buf->chan->subbuf_size;
+ 
+ 	if (buf->offset != buf->chan->subbuf_size + 1) {
+ 		buf->prev_padding = buf->chan->subbuf_size - buf->offset;
+@@ -98,14 +98,7 @@ static size_t __stp_relay_switch_subbuf(struct rchan_buf *buf, size_t length)
+ 	buf->data = new;
+ 	buf->padding[new_subbuf] = 0;
+ 
+-	if (unlikely(length + buf->offset > buf->chan->subbuf_size))
+-		goto toobig;
+-
+ 	return length;
+-
+-toobig:
+-	buf->chan->last_toobig = length;
+-	return 0;
+ }
+ 
+ static void __stp_relay_wakeup_readers(struct rchan_buf *buf)
+@@ -117,24 +110,17 @@ static void __stp_relay_wakeup_readers(struct rchan_buf *buf)
+ 
+ static void __stp_relay_wakeup_timer(stp_timer_callback_parameter_t unused)
+ {
+-#ifdef STP_BULKMODE
+ 	int i;
+-#endif
+ 
+ 	if (atomic_read(&_stp_relay_data.wakeup)) {
+ 		struct rchan_buf *buf;
+ 		
+ 		atomic_set(&_stp_relay_data.wakeup, 0);
+-#ifdef STP_BULKMODE
+ 		for_each_possible_cpu(i) {
+ 			buf = _stp_get_rchan_subbuf(_stp_relay_data.rchan->buf,
+ 						    i);
+ 			__stp_relay_wakeup_readers(buf);
+ 		}
+-#else
+-		buf = _stp_get_rchan_subbuf(_stp_relay_data.rchan->buf, 0);
+-		__stp_relay_wakeup_readers(buf);
+-#endif
+ 	}
+ 
+ 	if (atomic_read(&_stp_relay_data.transport_state) == STP_TRANSPORT_RUNNING)
+@@ -235,55 +221,8 @@ static void _stp_transport_data_fs_stop(void)
+ 		atomic_set (&_stp_relay_data.transport_state, STP_TRANSPORT_STOPPED);
+ 		del_timer_sync(&_stp_relay_data.timer);
+ 		dbug_trans(0, "flushing...\n");
+-		if (_stp_relay_data.rchan) {
+-			struct rchan_buf *buf;
+-
+-			/* NB we cannot call relay_flush() directly here since
+-			 * we need to do inode locking ourselves.
+-			 */
+-
+-#ifdef STP_BULKMODE
+-			unsigned int i;
+-			struct rchan *rchan = _stp_relay_data.rchan;
+-
+-			for_each_possible_cpu(i) {
+-				buf = _stp_get_rchan_subbuf(rchan->buf, i);
+-				if (buf) {
+-					struct inode *inode = buf->dentry->d_inode;
+-
+-					/* NB we are in the syscall context which
+-					 * allows sleeping. The following inode
+-					 * locking might sleep. See PR26131. */
+-					_stp_lock_inode(inode);
+-
+-					/* NB we intentionally avoids calling
+-					 * our own __stp_relay_switch_subbuf()
+-					 * since here we can sleep. */
+-					relay_switch_subbuf(buf, 0);
+-
+-					_stp_unlock_inode(inode);
+-				}
+-			}
+-#else  /* !STP_BULKMODE */
+-			buf = _stp_get_rchan_subbuf(_stp_relay_data.rchan->buf, 0);
+-
+-			if (buf != NULL) {
+-				struct inode *inode = buf->dentry->d_inode;
+-
+-				/* NB we are in the syscall context which allows
+-				 * sleeping. The following inode locking might
+-				 * sleep. See PR26131. */
+-				_stp_lock_inode(inode);
+-
+-				/* NB we intentionally avoids calling
+-				 * our own __stp_relay_switch_subbuf()
+-				 * since here we can sleep. */
+-				relay_switch_subbuf(buf, 0);
+-
+-				_stp_unlock_inode(inode);
+-			}
+-#endif
+-		}
++		if (_stp_relay_data.rchan)
++			relay_flush(_stp_relay_data.rchan);
+ 	}
+ }
+ 
+@@ -308,9 +247,7 @@ static int _stp_transport_data_fs_init(void)
+ 
+ 	/* Create "trace" file. */
+ 	npages = _stp_subbuf_size * _stp_nsubbufs;
+-#ifdef STP_BULKMODE
+ 	npages *= num_online_cpus();
+-#endif
+ 	npages >>= PAGE_SHIFT;
+ 	si_meminfo(&si);
+ #define MB(i) (unsigned long)((i) >> (20 - PAGE_SHIFT))
+@@ -347,9 +284,7 @@ static int _stp_transport_data_fs_init(void)
+         {
+                 u64 relay_mem;
+                 relay_mem = _stp_subbuf_size * _stp_nsubbufs;
+-#ifdef STP_BULKMODE
+                 relay_mem *= num_online_cpus();
+-#endif
+                 _stp_allocated_net_memory += relay_mem;
+                 _stp_allocated_memory += relay_mem;
+         }
+@@ -386,12 +321,7 @@ _stp_data_write_reserve(size_t size_request, void **entry)
+ 		return -EINVAL;
+ 
+ 	buf = _stp_get_rchan_subbuf(_stp_relay_data.rchan->buf,
+-#ifdef STP_BULKMODE
+-				    smp_processor_id()
+-#else
+-				    0
+-#endif
+-				    );
++				    smp_processor_id());
+ 	if (unlikely(buf->offset + size_request > buf->chan->subbuf_size)) {
+ 		size_request = __stp_relay_switch_subbuf(buf, size_request);
+ 		if (!size_request)
+@@ -411,65 +341,10 @@ static unsigned char *_stp_data_entry_data(void *entry)
+ 
+ static int _stp_data_write_commit(void *entry)
+ {
+-	/* Nothing to do here. */
+-	return 0;
+-}
+-
+-static noinline int _stp_transport_trylock_relay_inode(void)
+-{
+-	unsigned i;
+ 	struct rchan_buf *buf;
+-	struct inode *inode;
+-#ifdef DEBUG_TRANS
+-	cycles_t begin;
+-#endif
+ 
+ 	buf = _stp_get_rchan_subbuf(_stp_relay_data.rchan->buf,
+-#ifdef STP_BULKMODE
+-				    smp_processor_id()
+-#else
+-				    0
+-#endif
+-				    );
+-	if (buf == NULL)
+-		return 0;
+-
+-	inode = buf->dentry->d_inode;
+-
+-#ifdef DEBUG_TRANS
+-	begin = get_cycles();
+-#endif
+-
+-	/* NB this bounded spinlock is needed for stream mode. it is observed
+-	 * that almost all of the iterations needed are less than 50K iterations
+-	 * or about 300K cycles.
+-	 */
+-	for (i = 0; i < 50 * 1000; i++) {
+-		if (_stp_trylock_inode(inode)) {
+-			dbug_trans(3, "got inode lock: i=%u: cycles: %llu", i,
+-				   get_cycles() - begin);
+-			return 1;
+-		}
+-	}
+-
+-	dbug_trans(0, "failed to get inode lock: i=%u: cycles: %llu", i,
+-		   get_cycles() - begin);
++				    smp_processor_id());
++	__stp_relay_switch_subbuf(buf, 0);
+ 	return 0;
+ }
+-
+-static void _stp_transport_unlock_relay_inode(void)
+-{
+-	struct rchan_buf *buf;
+-
+-	buf = _stp_get_rchan_subbuf(_stp_relay_data.rchan->buf,
+-#ifdef STP_BULKMODE
+-				    smp_processor_id()
+-#else
+-				    0
+-#endif
+-				    );
+-	if (buf == NULL)
+-		return;
+-
+-	_stp_unlock_inode(buf->dentry->d_inode);
+-}
+diff --git a/runtime/transport/transport.c b/runtime/transport/transport.c
+index 96426eb7b..1be3e9485 100644
+--- a/runtime/transport/transport.c
++++ b/runtime/transport/transport.c
+@@ -49,7 +49,6 @@ static int _stp_probes_started = 0;
+  * transport state flag is atomic. */
+ static atomic_t _stp_transport_state = ATOMIC_INIT(_STP_TS_UNINITIALIZED);
+ 
+-static inline int _stp_trylock_inode(struct inode *inode);
+ static inline void _stp_lock_inode(struct inode *inode);
+ static inline void _stp_unlock_inode(struct inode *inode);
+ 
+@@ -70,8 +69,8 @@ static inline void _stp_unlock_inode(struct inode *inode);
+ #include "procfs.c"
+ #include "control.c"
+ 
+-static unsigned _stp_nsubbufs = 8;
+-static unsigned _stp_subbuf_size = 65536*4;
++static unsigned _stp_nsubbufs = 256;
++static unsigned _stp_subbuf_size = STP_BUFFER_SIZE;
+ 
+ /* module parameters */
+ static int _stp_bufsize;
+@@ -643,23 +642,6 @@ err0:
+ 	return -1;
+ }
+ 
+-/* returns 1 when the lock is successfully acquired, 0 otherwise. */
+-static inline int _stp_trylock_inode(struct inode *inode)
+-{
+-#ifdef STAPCONF_INODE_RWSEM
+-	return inode_trylock(inode);
+-#else
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,16)
+-	return mutex_trylock(&inode->i_mutex);
+-#else
+-	/* NB down_trylock() uses a different convention where 0 means
+-	 * the lock is successfully acquired.
+-	 */
+-	return !down_trylock(&inode->i_sem);
+-#endif
+-#endif
+-}
+-
+ static inline void _stp_lock_inode(struct inode *inode)
+ {
+ #ifdef STAPCONF_INODE_RWSEM
+diff --git a/runtime/transport/transport.h b/runtime/transport/transport.h
+index 51723b7f5..cc09fc0ae 100644
+--- a/runtime/transport/transport.h
++++ b/runtime/transport/transport.h
+@@ -98,24 +98,6 @@ enum _stp_transport_state {
+  */
+ static enum _stp_transport_state _stp_transport_get_state(void);
+ 
+-/*
+- * _stp_transport_trylock_relay_inode
+- *
+- * This function locks the relay file inode to protect against relay readers
+- * (i.e., staprun/stapio).
+- * Returns whether the lock is successfully obtained.
+- */
+-static noinline int _stp_transport_trylock_relay_inode(void);
+-
+-/*
+- * _stp_transport_unlock_relay_inode
+- *
+- * This function releases the lock obtained by
+- * _stp_transport_trylock_relay_inode.
+- * should only call this when the lock is indeed obtained.
+- */
+-static void _stp_transport_unlock_relay_inode(void);
+-
+ /*
+  * _stp_transport_data_fs_init
+  *
+diff --git a/staprun/relay.c b/staprun/relay.c
+index 2f5f2e06a..c76e76719 100644
+--- a/staprun/relay.c
++++ b/staprun/relay.c
+@@ -131,6 +131,7 @@ static void *reader_thread(void *data)
+ 	sigset_t sigs;
+ 	off_t wsize = 0;
+ 	int fnum = 0;
++	cpu_set_t cpu_mask;
+ 
+ 	sigemptyset(&sigs);
+ 	sigaddset(&sigs,SIGUSR2);
+@@ -139,21 +140,18 @@ static void *reader_thread(void *data)
+ 	sigfillset(&sigs);
+ 	sigdelset(&sigs,SIGUSR2);
+ 
+-	if (bulkmode) {
+-		cpu_set_t cpu_mask;
+-		CPU_ZERO(&cpu_mask);
+-		CPU_SET(cpu, &cpu_mask);
+-		if( sched_setaffinity( 0, sizeof(cpu_mask), &cpu_mask ) < 0 )
+-			_perr("sched_setaffinity");
++	CPU_ZERO(&cpu_mask);
++	CPU_SET(cpu, &cpu_mask);
++	if( sched_setaffinity( 0, sizeof(cpu_mask), &cpu_mask ) < 0 )
++		_perr("sched_setaffinity");
+ #ifdef NEED_PPOLL
+-		/* Without a real ppoll, there is a small race condition that could */
+-		/* block ppoll(). So use a timeout to prevent that. */
+-		timeout->tv_sec = 10;
+-		timeout->tv_nsec = 0;
++	/* Without a real ppoll, there is a small race condition that could */
++	/* block ppoll(). So use a timeout to prevent that. */
++	timeout->tv_sec = 10;
++	timeout->tv_nsec = 0;
+ #else
+-		timeout = NULL;
++	timeout = NULL;
+ #endif
+-	}
+ 
+         if (reader_timeout_ms && timeout) {
+                 timeout->tv_sec = reader_timeout_ms / 1000;
+@@ -358,11 +356,6 @@ int init_relayfs(void)
+ 		_err("couldn't open %s.\n", buf);
+ 		return -1;
+ 	}
+-	if (ncpus > 1 && bulkmode == 0) {
+-		_err("ncpus=%d, bulkmode = %d\n", ncpus, bulkmode);
+-		_err("This is inconsistent! Please file a bug report. Exiting now.\n");
+-		return -1;
+-	}
+ 
+         /* PR7097 */
+         if (load_only)
+commit d86b64029598f69b47d9cf4295f30b7093f38cfc
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 9 17:22:27 2020 -0800
+
+    Revert "REVERTME: tapset-timers: work around on-the-fly deadlocks caused by mutex_trylock"
+    
+    This reverts commit 6a27888b118b7a94650a68aae028957cdd5fb5f5.
+    
+    No longer needed. As promised, we're reverting this.
+
+diff --git a/tapset-timers.cxx b/tapset-timers.cxx
+index 503498c85..10da17cda 100644
+--- a/tapset-timers.cxx
++++ b/tapset-timers.cxx
+@@ -391,11 +391,11 @@ hrtimer_derived_probe_group::emit_module_refresh (systemtap_session& s)
+   s.op->newline(+1) <<   "struct stap_hrtimer_probe* stp = &stap_hrtimer_probes[i];";
+   // timer disabled, but condition says enabled?
+   s.op->newline( 0) <<   "if (!stp->enabled && stp->probe->cond_enabled) {";
+-  s.op->newline(+1) <<     "//dbug_otf(\"enabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
++  s.op->newline(+1) <<     "dbug_otf(\"enabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
+   s.op->newline( 0) <<     "_stp_hrtimer_start(stp);";
+   // timer enabled, but condition says disabled?
+   s.op->newline(-1) <<   "} else if (stp->enabled && !stp->probe->cond_enabled) {";
+-  s.op->newline(+1) <<     "//dbug_otf(\"disabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
++  s.op->newline(+1) <<     "dbug_otf(\"disabling (hrtimer) pidx %zu\\n\", stp->probe->index);";
+   s.op->newline( 0) <<     "_stp_hrtimer_cancel(stp);";
+   s.op->newline(-1) <<   "}";
+   s.op->newline( 0) <<   "stp->enabled = stp->probe->cond_enabled;";
+commit 3abe2c40b2dae499aff2e31beff121fbe43f7654
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Fri Dec 11 12:31:25 2020 -0800
+
+    transport: set is_global to zero even when bulkmode is disabled
+    
+    This is needed now that we always want per-cpu logger threads. When
+    is_global is set to a non-zero value, relay won't create per-cpu log
+    files.
+
+diff --git a/runtime/transport/debugfs.c b/runtime/transport/debugfs.c
+index 28a5bf89d..bd20281a0 100644
+--- a/runtime/transport/debugfs.c
++++ b/runtime/transport/debugfs.c
+@@ -256,13 +256,8 @@ __stp_debugfs_relay_create_buf_file_callback(const char *filename,
+ 	 * cause relay_open() to create a single global buffer rather
+ 	 * than the default set of per-cpu buffers.
+ 	 */
+-	if (is_global) {
+-#ifdef STP_BULKMODE
++	if (is_global)
+ 		*is_global = 0;
+-#else
+-		*is_global = 1;
+-#endif
+-	}
+ 
+ 	if (IS_ERR(file)) {
+ 		file = NULL;
+diff --git a/runtime/transport/procfs.c b/runtime/transport/procfs.c
+index 262409356..b0a5d5760 100644
+--- a/runtime/transport/procfs.c
++++ b/runtime/transport/procfs.c
+@@ -328,13 +328,8 @@ __stp_procfs_relay_create_buf_file_callback(const char *filename,
+   unsigned i = 0;
+   struct inode* in;
+   
+-  if (is_global) {
+-#ifdef STP_BULKMODE
++  if (is_global)
+           *is_global = 0;
+-#else
+-          *is_global = 1;
+-#endif
+-  }
+   
+   if (parent != _stp_procfs_module_dir_path.dentry)
+     goto out;
+commit a26bf7890196395d73ac193b23e271398731745d
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Fri Dec 11 15:39:29 2020 -0500
+
+    relay transport: comment on STP_BULK message
+    
+    While we've eliminated any STP_BULKMODE effects from the way relayfs
+    files are used ("always bulkmode"), staprun/stapio still need to know
+    whether the user intended "stap -b" or not, so they can save files
+    stpd_cpu* files separately.
+
+diff --git a/runtime/transport/control.c b/runtime/transport/control.c
+index 9343b3c28..d123bef2f 100644
+--- a/runtime/transport/control.c
++++ b/runtime/transport/control.c
+@@ -88,6 +88,9 @@ static ssize_t _stp_ctl_write_cmd(struct file *file, const char __user *buf, siz
+ 		break;
+ 
+ 	case STP_BULK:
++                // NB: this signals the runtime to save separate
++                // per-cpu files; our kernel->userspace files are now
++                // always bulkmode (trace$N files).
+ #ifdef STP_BULKMODE
+                 // no action needed
+                 break;
+commit b43eb4ed690bf2421978ed2896667e45e60c3400
+Author: Cosmin Tanislav <demonsingur@gmail.com>
+Date:   Thu Dec 10 16:48:54 2020 -0500
+
+    bugfix: runtime: transport: handle more error cases in module init
+    
+    Signed-off-by: Sultan Alsawaf <sultan@openresty.com>
+
+diff --git a/runtime/transport/relay_v2.c b/runtime/transport/relay_v2.c
+index 2ba5eea7d..27729f4c8 100644
+--- a/runtime/transport/relay_v2.c
++++ b/runtime/transport/relay_v2.c
+@@ -277,6 +277,7 @@ static int _stp_transport_data_fs_init(void)
+ #endif  /* (RELAYFS_CHANNEL_VERSION < 7) */
+ 	if (!_stp_relay_data.rchan) {
+ 		rc = -ENOENT;
++		errk("%s: relay_open() failed: %d\n", THIS_MODULE->name, rc);
+ 		goto err;
+ 	}
+         /* Increment _stp_allocated_memory and _stp_allocated_net_memory to account for buffers
+diff --git a/runtime/transport/transport.c b/runtime/transport/transport.c
+index 1be3e9485..f005e14e2 100644
+--- a/runtime/transport/transport.c
++++ b/runtime/transport/transport.c
+@@ -552,6 +552,8 @@ static void _stp_transport_close(void)
+  */
+ static int _stp_transport_init(void)
+ {
++	int ret;
++
+ 	dbug_trans(1, "transport_init\n");
+ #ifdef STAPCONF_TASK_UID
+ 	_stp_uid = current->uid;
+@@ -603,20 +605,28 @@ static int _stp_transport_init(void)
+ 		dbug_trans(1, "Using %d subbufs of size %d\n", _stp_nsubbufs, _stp_subbuf_size);
+ 	}
+ 
+-	if (_stp_transport_fs_init(THIS_MODULE->name) != 0)
++	ret = _stp_transport_fs_init(THIS_MODULE->name);
++	if (ret)
+ 		goto err0;
+ 
+ 	/* create control channel */
+-	if (_stp_register_ctl_channel() < 0)
++	ret = _stp_register_ctl_channel();
++	if (ret < 0)
+ 		goto err1;
+ 
+ 	/* create print buffers */
+-	if (_stp_print_init() < 0)
++	ret = _stp_print_init();
++	if (ret < 0) {
++		errk("%s: can't create print buffers!", THIS_MODULE->name);
+ 		goto err2;
++	}
+ 
+ 	/* set _stp_module_self dynamic info */
+-	if (_stp_module_update_self() < 0)
++	ret = _stp_module_update_self();
++	if (ret < 0) {
++		errk("%s: can't update dynamic info!", THIS_MODULE->name);
+ 		goto err3;
++	}
+ 
+ 	/* start transport */
+ 	_stp_transport_data_fs_start();
+@@ -639,7 +649,7 @@ err2:
+ err1:
+ 	_stp_transport_fs_close();
+ err0:
+-	return -1;
++	return ret;
+ }
+ 
+ static inline void _stp_lock_inode(struct inode *inode)
+commit 341bf33f14062269c52bcebaa309518d9972ca00
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Fri Dec 11 18:06:36 2020 -0500
+
+    staprun: handle more and fewer cpus better
+    
+    NR_CPUS was a hard-coded minimum and maximum on the number of CPUs
+    worth of trace$N files staprun/stapio would open at startup.  While a
+    constant is useful for array sizing (and so might as well be really
+    large), the actual iteration should be informed by get_nprocs_conf(3).
+    
+    This patch replaces NR_CPUS with MAX_NR_CPUS (now 1024, why not), and
+    limits open/thread iterations to the actual number of processors.  It
+    even prints an error if a behemoth >1K-core machine comes into being.
+
+diff --git a/staprun/relay.c b/staprun/relay.c
+index c76e76719..3eb8df34b 100644
+--- a/staprun/relay.c
++++ b/staprun/relay.c
+@@ -12,16 +12,16 @@
+ 
+ #include "staprun.h"
+ 
+-int out_fd[NR_CPUS];
++int out_fd[MAX_NR_CPUS];
+ int monitor_end = 0;
+-static pthread_t reader[NR_CPUS];
+-static int relay_fd[NR_CPUS];
+-static int avail_cpus[NR_CPUS];
+-static int switch_file[NR_CPUS];
+-static pthread_mutex_t mutex[NR_CPUS];
++static pthread_t reader[MAX_NR_CPUS];
++static int relay_fd[MAX_NR_CPUS];
++static int avail_cpus[MAX_NR_CPUS];
++static int switch_file[MAX_NR_CPUS];
++static pthread_mutex_t mutex[MAX_NR_CPUS];
+ static int bulkmode = 0;
+ static volatile int stop_threads = 0;
+-static time_t *time_backlog[NR_CPUS];
++static time_t *time_backlog[MAX_NR_CPUS];
+ static int backlog_order=0;
+ #define BACKLOG_MASK ((1 << backlog_order) - 1)
+ #define MONITORLINELENGTH 4096
+@@ -313,12 +313,19 @@ int init_relayfs(void)
+ 	if (send_request(STP_BULK, rqbuf, sizeof(rqbuf)) == 0)
+ 		bulkmode = 1;
+ 
+-	/* Try to open a slew of per-cpu trace%d files.  Per PR19241, we
+-	   need to go through all potentially present CPUs up to NR_CPUS, that
+-	   we hope is a reasonable limit.  For !bulknode, "trace0" will be
+-	   typically used. */
++	/* Try to open a slew of per-cpu trace%d files.  Per PR19241,
++	   we need to go through all potentially present CPUs up to
++	   get_nprocs_conf(), up to MAX_NR_CPUS (used for array
++	   allocations).  For !bulknode, "trace0" will be typically
++	   used, prior to systemtap 4.5; after, all are used. */
+ 
+-	for (i = 0; i < NR_CPUS; i++) {
++        int nprocs = get_nprocs_conf();
++        if (nprocs > MAX_NR_CPUS) {
++                err("Too many CPUs: get_nprocs_conf()=%d vs MAX_NR_CPUS=%d\n", nprocs, MAX_NR_CPUS);
++                return -1;
++        }
++        
++	for (i = 0; i < nprocs; i++) {
+                 relay_fd[i] = -1;
+ 
+ #ifdef HAVE_OPENAT
+@@ -348,7 +355,8 @@ int init_relayfs(void)
+ 		}
+ 	}
+ 	ncpus = cpui;
+-	dbug(2, "ncpus=%d, bulkmode = %d\n", ncpus, bulkmode);
++        /* ncpus could be smaller than nprocs if some cpus are offline */
++	dbug(2, "ncpus=%d, nprocs=%d, bulkmode=%d\n", ncpus, nprocs, bulkmode);
+ 	for (i = 0; i < ncpus; i++)
+ 		dbug(2, "cpui=%d, relayfd=%d\n", i, avail_cpus[i]);
+ 
+diff --git a/staprun/relay_old.c b/staprun/relay_old.c
+index f0d2e918f..248e6059d 100644
+--- a/staprun/relay_old.c
++++ b/staprun/relay_old.c
+@@ -14,12 +14,12 @@
+ #include "staprun.h"
+ 
+ /* temporary per-cpu output written here for relayfs, filebase0...N */
+-static int relay_fd[NR_CPUS];
+-static int proc_fd[NR_CPUS];
+-static FILE *percpu_tmpfile[NR_CPUS];
+-static char *relay_buffer[NR_CPUS];
+-static pthread_t reader[NR_CPUS];
+-static int switch_file[NR_CPUS];
++static int relay_fd[MAX_NR_CPUS];
++static int proc_fd[MAX_NR_CPUS];
++static FILE *percpu_tmpfile[MAX_NR_CPUS];
++static char *relay_buffer[MAX_NR_CPUS];
++static pthread_t reader[MAX_NR_CPUS];
++static int switch_file[MAX_NR_CPUS];
+ static int bulkmode = 0;
+ unsigned subbuf_size = 0;
+ unsigned n_subbufs = 0;
+@@ -37,7 +37,7 @@ static struct buf_status
+ {
+ 	struct _stp_buf_info info;
+ 	unsigned max_backlog; /* max # sub-buffers ready at one time */
+-} status[NR_CPUS];
++} status[MAX_NR_CPUS];
+ 
+ 
+ /**
+@@ -461,7 +461,13 @@ int init_oldrelayfs(void)
+ 	relay_fd[0] = -1;
+ 	out_fd[0] = 0;
+ 
+-	for (i = 0; i < NR_CPUS; i++) {
++        int nprocs = get_nprocs_conf();
++        if (nprocs > MAX_NR_CPUS) {
++                err("Too many CPUs: get_nprocs_conf()=%d vs MAX_NR_CPUS=%d\n", nprocs, MAX_NR_CPUS);
++                goto err;
++        }
++        
++	for (i = 0; i < nprocs; i++) {
+ 		int ret = open_relayfs_files(i, relay_filebase, proc_filebase);
+ 		if (ret == 0)
+ 			break;
+@@ -472,7 +478,8 @@ int init_oldrelayfs(void)
+ 	}
+ 
+ 	ncpus = i;
+-	dbug(2, "ncpus=%d\n", ncpus);
++        /* ncpus could be smaller than nprocs if some cpus are offline */
++	dbug(2, "ncpus=%d, nprocs=%d\n", ncpus, nprocs);
+ 
+ 	if (ncpus == 0) {
+ 		err("Couldn't open relayfs files.\n");
+diff --git a/staprun/stap_merge.c b/staprun/stap_merge.c
+index 7507f0e3d..87de7d465 100644
+--- a/staprun/stap_merge.c
++++ b/staprun/stap_merge.c
+@@ -31,15 +31,15 @@ static void usage (char *prog)
+ }
+ 
+ #define TIMESTAMP_SIZE (sizeof(int))
+-#define NR_CPUS 256
++#define MAX_NR_CPUS 1024
+ 
+ int main (int argc, char *argv[])
+ {
+ 	char *buf, *outfile_name = NULL;
+ 	int c, i, j, rc, dropped=0;
+-	long count=0, min, num[NR_CPUS] = { 0 };
++	long count=0, min, num[MAX_NR_CPUS] = { 0 };
+ 	FILE *ofp = NULL;
+-	FILE *fp[NR_CPUS] = { 0 };
++	FILE *fp[MAX_NR_CPUS] = { 0 };
+ 	int ncpus, len, verbose = 0;
+ 	int bufsize = 65536;
+ 
+@@ -67,6 +67,10 @@ int main (int argc, char *argv[])
+ 
+ 	i = 0;
+ 	while (optind < argc) {
++                if (i >= MAX_NR_CPUS) {
++                        fprintf(stderr, "too many files (MAX_NR_CPUS=%d)\n", MAX_NR_CPUS);
++			return -1;
++		}                  
+ 		fp[i] = fopen(argv[optind++], "r");
+ 		if (!fp[i]) {
+ 			fprintf(stderr, "error opening file %s.\n", argv[optind - 1]);
+diff --git a/staprun/staprun.h b/staprun/staprun.h
+index e05dbe5b6..2d68bf527 100644
+--- a/staprun/staprun.h
++++ b/staprun/staprun.h
+@@ -37,6 +37,7 @@
+ #include <sys/wait.h>
+ #include <sys/statfs.h>
+ #include <syslog.h>
++#include <sys/sysinfo.h>
+ 
+ /* Include config.h to pick up dependency for --prefix usage. */
+ #include "../config.h"
+@@ -285,10 +286,10 @@ extern int optopt;
+ extern int optind;
+ 
+ /* maximum number of CPUs we can handle */
+-#define NR_CPUS 256
++#define MAX_NR_CPUS 1024
+ 
+ /* relay*.c uses these */
+-extern int out_fd[NR_CPUS];
++extern int out_fd[MAX_NR_CPUS];
+ 
+ /* relay_old uses these. Set in ctl.c */
+ extern unsigned subbuf_size;
+commit b4b5a29b51586f75de16cacdb44bdf0b3ad0478e
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Mon Dec 14 13:20:34 2020 -0800
+
+    staprun: use the correct out_fd when bulkmode and fsize_max aren't used
+    
+    When bulkmode and fsize_max aren't used, there is only one output fd and
+    it is stored at out_fd[avail_cpus[0]].
+
+diff --git a/staprun/relay.c b/staprun/relay.c
+index 3eb8df34b..d0202e52f 100644
+--- a/staprun/relay.c
++++ b/staprun/relay.c
+@@ -232,10 +232,17 @@ static void *reader_thread(void *data)
+ 					wbuf += bytes;
+ 					wsize += bytes;
+ 				} else {
+-	                                rc = write(out_fd[cpu], wbuf, wbytes);
++					int fd;
++					/* Only bulkmode and fsize_max use per-cpu output files. Otherwise,
++					   there's just a single output fd stored at out_fd[avail_cpus[0]]. */
++					if (bulkmode || fsize_max)
++						fd = out_fd[cpu];
++					else
++						fd = out_fd[avail_cpus[0]];
++	                                rc = write(fd, wbuf, wbytes);
+ 	                                if (rc <= 0) {
+ 						perr("Couldn't write to output %d for cpu %d, exiting.",
+-	                                             out_fd[cpu], cpu);
++	                                             fd, cpu);
+ 	                                        goto error_out;
+ 	                                }
+ 	                                wbytes -= rc;
+commit b26b4e2c257e0bd65134eed5e51d754227a4ed3f
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 30 14:21:42 2020 -0800
+
+    task_finder2: fix panics due to broken task work cancellation
+    
+    The task_work_cancel() API uses function pointers to uniquely identify
+    task work structs, so there's no guarantee that a specific task work
+    struct we want to cancel is the one that will actually get canceled.
+    This issue would cause task work structs to be freed while they were
+    still queued up on the task's task-worker list.
+    
+    This is an example of one such panic, where the DEBUG_MEM feature
+    reported that a __stp_tf_task_work struct (56 bytes) wasn't freed,
+    because that specific task worker got canceled and instead an active
+    task worker got freed!
+    
+    orxray_resty_mem_X_35062: ERROR: Memory ffff8809ed388620 len=56 allocation type: kmalloc. Not freed.
+    BUG: unable to handle kernel paging request at ffffffffa0570877
+    IP: [<ffffffffa0570877>] 0xffffffffa0570876
+    PGD 1abd067 PUD 1abe063 PMD 1028286067 PTE 0
+    Oops: 0010 [#1] SMP
+    CPU: 3 PID: 1338 Comm: nginx Tainted: G           OE  ------------   3.10.0-514.10.2.el7.x86_64.debug #1
+    Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.13.0-2.fc32 04/01/2014
+    task: ffff880eae2d0000 ti: ffff880eaf2e4000 task.ti: ffff880eaf2e4000
+    RIP: 0010:[<ffffffffa0570877>]  [<ffffffffa0570877>] 0xffffffffa0570876
+    RSP: 0018:ffff880eaf2e7d78  EFLAGS: 00010282
+    RAX: 0000000000000001 RBX: 0000000000000000 RCX: 0000000000000000
+    RDX: ffff8809ed388640 RSI: 0000000000000000 RDI: ffff8809ed388640
+    RBP: ffff880eaf2e7da0 R08: 0000000000000000 R09: 0000000000000000
+    R10: 0000000000000001 R11: ffffffffff90001c R12: ffffffff8248b1c0
+    R13: ffff880eae2d0818 R14: ffff880eae2d0000 R15: 00007eff3d2490b0
+    FS:  00007eff3dcd2740(0000) GS:ffff881037c00000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: ffffffffa0570877 CR3: 0000000ebce67000 CR4: 00000000003406e0
+    DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+    Stack:
+     ffffffff810c6544 ffff880eaf2e7f58 ffff880eaf2e7e70 ffff880eae2d0000
+     00007eff3dcb3338 ffff880eaf2e7e38 ffffffff810b31ba ffff880eaf2e7dc0
+     ffffffff8106c279 ffff880eaf2e7e50 ffff880ef8a792c0 ffff880eaf2e7df8
+    Call Trace:
+     [<ffffffff810c6544>] ? task_work_run+0xb4/0xe0
+     [<ffffffff810b31ba>] get_signal_to_deliver+0x85a/0x960
+     [<ffffffff8106c279>] ? kvm_sched_clock_read+0x9/0x20
+     [<ffffffff810e7b4d>] ? sched_clock_local+0x1d/0x80
+     [<ffffffff810e7dd8>] ? sched_clock_cpu+0xb8/0xe0
+     [<ffffffff810324a7>] do_signal+0x57/0x6e0
+     [<ffffffff8176dba6>] ? int_very_careful+0x5/0xd
+     [<ffffffff81032b8f>] do_notify_resume+0x5f/0xb0
+     [<ffffffff8176dbfd>] int_signal+0x12/0x17
+    Code:  Bad RIP value.
+    RIP  [<ffffffffa0570877>] 0xffffffffa0570876
+     RSP <ffff880eaf2e7d78>
+    CR2: ffffffffa0570877
+    ---[ end trace 1cdf8e5b522b246e ]---
+
+diff --git a/runtime/linux/task_finder2.c b/runtime/linux/task_finder2.c
+index 4e0b68f7c..ecf1f77fd 100644
+--- a/runtime/linux/task_finder2.c
++++ b/runtime/linux/task_finder2.c
+@@ -226,10 +226,22 @@ static void __stp_tf_cancel_all_task_work(void)
+ 	// Cancel all remaining requests.
+ 	stp_spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
+ 	list_for_each_entry_safe(node, tmp, &__stp_tf_task_work_list, list) {
+-		if (stp_task_work_cancel(node->task, node->work.func)) {
+-			list_del(&node->list);
+-			_stp_kfree(node);
+-		}
++		struct __stp_tf_task_work *tf_work;
++		struct task_work *work;
++
++		work = stp_task_work_cancel(node->task, node->work.func);
++		if (!work)
++			continue;
++
++		/*
++		 * There can be multiple queued task workers with the same
++		 * worker func, so there's no guarantee that tf_work == node.
++		 * Therefore, we can only free what stp_task_work_cancel() just
++		 * gave us; freeing 'node' would be unsafe.
++		 */
++		tf_work = container_of(work, typeof(*tf_work), work);
++		list_del(&tf_work->list);
++		_stp_kfree(tf_work);
+ 	}
+ 	stp_spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
+ }
+commit 96470399a5a6fba864b90afd15eda43cdc8c8ac4
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 30 15:42:11 2020 -0800
+
+    task_finder2: fix list corruption in __stp_tf_cancel_all_task_work()
+    
+    The previous commit (b26b4e2c2 "task_finder2: fix panics due to broken
+    task work cancellation") made it possible for the next node in the task
+    work list to be free, which would made list_for_each_entry_safe() not so
+    safe anymore. Using list_for_each_entry_safe() is still the fastest
+    approach here, so when the next node in the list happens to be freed, we
+    should just restart iteration on the list.
+
+diff --git a/runtime/linux/task_finder2.c b/runtime/linux/task_finder2.c
+index ecf1f77fd..83fc17b5e 100644
+--- a/runtime/linux/task_finder2.c
++++ b/runtime/linux/task_finder2.c
+@@ -225,6 +225,7 @@ static void __stp_tf_cancel_all_task_work(void)
+ 
+ 	// Cancel all remaining requests.
+ 	stp_spin_lock_irqsave(&__stp_tf_task_work_list_lock, flags);
++restart:
+ 	list_for_each_entry_safe(node, tmp, &__stp_tf_task_work_list, list) {
+ 		struct __stp_tf_task_work *tf_work;
+ 		struct task_work *work;
+@@ -242,6 +243,21 @@ static void __stp_tf_cancel_all_task_work(void)
+ 		tf_work = container_of(work, typeof(*tf_work), work);
+ 		list_del(&tf_work->list);
+ 		_stp_kfree(tf_work);
++
++		/*
++		 * If the tf_work we just freed was the next node in the list,
++		 * then we need to restart the list iteration because
++		 * list_for_each_entry_safe() can't cope with the next node
++		 * being freed. We still need to use list_for_each_entry_safe()
++		 * because we need to get through one successful pass through
++		 * the entire list, since it's not guaranteed that this list
++		 * will be empty when this function exits, as there can still be
++		 * active task workers running, which is fine since the
++		 * stp_task_work API will wait for all task workers to finish
++		 * before allowing the module to unload.
++		 */
++		if (tf_work == tmp)
++			goto restart;
+ 	}
+ 	stp_spin_unlock_irqrestore(&__stp_tf_task_work_list_lock, flags);
+ }
+commit 6cb54128e005d1220a7b064ee42b9f72561c28e7
+Author: Sultan Alsawaf <sultan@openresty.com>
+Date:   Wed Dec 30 15:47:58 2020 -0800
+
+    task_finder2: fix task worker race on module unload
+    
+    Unfortunately, __stp_tf_cancel_all_task_work() does not guarantee that
+    all of the task finder's task workers will be finished executing when it
+    returns. In this case, we rely on the stp_task_work API to prevent the
+    module from being unloaded while there are task workers in-flight, which
+    works, but the stp_task_work API is notified of a task worker finishing
+    before it actually finishes. Inside __stp_tf_task_worker_fn(), the
+    call to the task worker's function (tf_work->func) is where the final
+    refcount in the stp_task_work API could be put, but there will still be
+    instructions left in the task worker that will be executing for a short
+    time after that. In that short time, there can be a race where the
+    module is unloaded before the task worker finishes executing all of its
+    instructions, especially if the task worker gets preempted during this
+    time on a PREEMPT kernel.
+    
+    To remedy this, we must ensure that the last instruction in
+    __stp_tf_task_worker_fn() is where the stp_task_work API is notified of
+    a task worker finishing.
+
+diff --git a/runtime/linux/task_finder2.c b/runtime/linux/task_finder2.c
+index 83fc17b5e..2bab19295 100644
+--- a/runtime/linux/task_finder2.c
++++ b/runtime/linux/task_finder2.c
+@@ -150,6 +150,7 @@ __stp_tf_task_worker_fn(struct task_work *work)
+ 	 * workers for this task.
+ 	 */
+ 	__stp_tf_task_work_free(work);
++	stp_task_work_func_done();
+ }
+ 
+ static void
+@@ -1066,11 +1067,8 @@ __stp_tf_clone_worker(struct task_work *work)
+ 
+ 	might_sleep();
+ 	if (atomic_read(&__stp_task_finder_state) != __STP_TF_RUNNING
+-	    || current->flags & PF_EXITING) {
+-		/* Remember that this task_work_func is finished. */
+-		stp_task_work_func_done();
++	    || current->flags & PF_EXITING)
+ 		return;
+-	}
+ 
+ 	__stp_tf_handler_start();
+ 
+@@ -1085,10 +1083,6 @@ __stp_tf_clone_worker(struct task_work *work)
+ 	}
+ 
+ 	__stp_tf_handler_end();
+-
+-	/* Remember that this task_work_func is finished. */
+-	stp_task_work_func_done();
+-	return;
+ }
+ 
+ 
+@@ -1392,11 +1386,8 @@ __stp_tf_quiesce_worker(struct task_work *work)
+ 
+ 	might_sleep();
+ 	if (atomic_read(&__stp_task_finder_state) != __STP_TF_RUNNING
+-	    || current->flags & PF_EXITING) {
+-		/* Remember that this task_work_func is finished. */
+-		stp_task_work_func_done();
++	    || current->flags & PF_EXITING)
+ 		return;
+-	}
+ 
+         /* If we had a build-id based executable probe (so we have a
+          * tgt->build_id) set, we could not check it back in
+@@ -1420,8 +1411,6 @@ __stp_tf_quiesce_worker(struct task_work *work)
+                           (long) current->tgid, ok);
+                 if (!ok) {
+                         // stap_utrace_detach (current, & tgt->ops);
+-                        /* Remember that this task_work_func is finished. */
+-                        stp_task_work_func_done();
+                         return;
+                 }
+         } 
+@@ -1444,10 +1433,6 @@ __stp_tf_quiesce_worker(struct task_work *work)
+ 	__stp_call_callbacks(tgt, current, 1, (current->pid == current->tgid));
+ 
+ 	__stp_tf_handler_end();
+-
+-	/* Remember that this task_work_func is finished. */
+-	stp_task_work_func_done();
+-	return;
+ }
+ 
+ static u32
+@@ -1614,18 +1599,12 @@ __stp_tf_mmap_worker(struct task_work *work)
+ 
+ 	// See if we can find saved syscall info.
+ 	entry = __stp_tf_get_map_entry(current);
+-	if (entry == NULL) {
+-		/* Remember that this task_work_func is finished. */
+-		stp_task_work_func_done();
++	if (entry == NULL)
+ 		return;
+-	}
+ 
+ 	if (atomic_read(&__stp_task_finder_state) != __STP_TF_RUNNING
+ 	    || current->flags & PF_EXITING) {
+ 		__stp_tf_remove_map_entry(entry);
+-
+-		/* Remember that this task_work_func is finished. */
+-		stp_task_work_func_done();
+ 		return;
+ 	}
+ 
+@@ -1650,10 +1629,6 @@ __stp_tf_mmap_worker(struct task_work *work)
+ 	__stp_tf_remove_map_entry(entry);
+ 
+ 	__stp_tf_handler_end();
+-
+-	/* Remember that this task_work_func is finished. */
+-	stp_task_work_func_done();
+-	return;
+ }
+ 
+ static u32
