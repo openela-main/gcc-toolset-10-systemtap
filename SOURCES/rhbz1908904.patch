@@ -1,0 +1,44 @@
+commit e3287bddcdc51705bb206479daa82e97fb28071f
+Author: Frank Ch. Eigler <fche@redhat.com>
+Date:   Wed Dec 9 22:29:43 2020 -0500
+
+    PR27044: fix lock loop for conditional probes
+    
+    Emit a nested block carefully so that the "goto out;" from a failed
+    stp_lock_probe() call in that spot near the epilogue of a
+    probe-handler goes downward, not upward.
+
+diff --git a/translate.cxx b/translate.cxx
+index f0195486c..d7fe1e3b2 100644
+--- a/translate.cxx
++++ b/translate.cxx
+@@ -2969,21 +2969,21 @@ c_unparser::emit_probe (derived_probe* v)
+         {
+           // PR26296
+           // emit all read/write locks for global variables ... if somehow still not done by now
++          // emit a local out: label, for error catching in these condition exprs
++          o->newline() << "{";
++          o->newline(1) << "__label__ out, deref_fault;";
+           if (v->needs_global_locks ())
+             emit_lock ();
+ 
+           for (set<derived_probe*>::const_iterator
+-                it  = v->probes_with_affected_conditions.begin();
+-                it != v->probes_with_affected_conditions.end(); ++it)
++                 it  = v->probes_with_affected_conditions.begin();
++               it != v->probes_with_affected_conditions.end(); ++it)
+             {
+-              // emit a local out: label, for error catching in these condition exprs
+-              o->newline() << "{";
+-              o->newline(1) << "__label__ out, deref_fault;";
+               emit_probe_condition_update(*it);
+-              o->newline(-1) << "deref_fault: __attribute__((unused));";
+-              o->newline() << "out: __attribute__((unused));";
+-              o->newline() << "}";
+             }
++          o->newline(-1) << "deref_fault: __attribute__((unused));";
++          o->newline() << "out: __attribute__((unused));";
++          o->newline() << "}";
+         }
+ 
+       // PR26296
